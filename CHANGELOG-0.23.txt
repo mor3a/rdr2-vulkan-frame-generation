@@ -2,6 +2,9 @@
 
 - Removed the startup marker gate that could disable the mod and its menu.
   Existing startup.pending files and SafeStartup settings are ignored.
+- DLSS-G now checks inputs for the exact token selected for presentation.
+  A token being presented is protected against queue eviction. A global flag
+  from a different evaluation can no longer enable FG for an untagged frame.
 - Menu title: Frame Generation - 0.23.
 - DLSS-G controls are restricted to the previously tested 2x and 3x modes.
 - Experimental RTX 20 unlock is disabled by default in the distributed INI.
@@ -13,3 +16,7 @@ Validation: runtime compiled with 8 contract, 3 ABI, 5 FPS and 13 Nexus response
 checks passing. Public source compiled separately with its 16 checks passing.
 Existing VALIDATION.txt records the previous 0.22 game and performance tests.
 These checks do not prove all GPUs or game configurations are supported.
+The corrected runtime was tested in Story Mode on RTX 3050 Laptop with DLSS-G
+2x. The user confirmed the menu and FG worked; runtime telemetry reported
+approximately 2x displayed frames with status 0. This is not a full hardware
+matrix or a guarantee that every possible crash is eliminated.

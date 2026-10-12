@@ -11,7 +11,7 @@ void NgxProbeTick();
 //                         frame) then RenderSubmitEnd + PresentStart with this frame's token.
 //  PresentMarkersEnd():   PresentEnd with this frame's token, then start the NEXT frame:
 //                         new token, slReflexSleep, SimulationStart.
-void PresentMarkersBegin();
+bool PresentMarkersBegin();
 void PresentMarkersEnd();
 // True if a DLSS-SR evaluate filed tags+constants since the last call (the 3D world is
 // rendering). Clears the flag.

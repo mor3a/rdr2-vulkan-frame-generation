@@ -340,11 +340,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_QueuePresentKHR(VkQueue q, const VkPrese
   PosScope _p(1);
   NgxProbeTick();                  // cheap after hooked (one bool)
   if(Cfg().provider==FGProvider::FSR3){PollHotkeys();bool seen=ConsumeEvalSeen();Reentry guard;VkPresentInfoKHR overlay{};auto selected=MenuRender(q,pi,overlay)?&overlay:pi;auto result=FsrPresent(q,selected,seen && !MenuIsOpen());if(result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR)RecordGamePresent();return result;}
-  EvalGate(ConsumeEvalSeen());     // slDLSSGSetOptions on the present thread, before this present (guide 6.0)
+  ConsumeEvalSeen();
+  // Read readiness from the exact token selected for this present, not from
+  // an unrelated evaluation that may have run ahead on another thread.
+  const bool inputsReady=PresentMarkersBegin();
+  if(!inputsReady && g_genOn.exchange(false)){SetDLSSGeneration(false);g_evalStreak=0;}
+  EvalGate(inputsReady);
   double timing0=NowUs();
   if(Rt().presentPacing && g_genOn.load()) PacePresent(q);   // frame's GPU work done before PresentStart
   double timing1=NowUs();
-  PresentMarkersBegin();           // RenderSubmitEnd + PresentStart with this frame's token (present thread)
   PollDLSSGState();                // slDLSSGGetState on the present thread: status + generated-frame stats
   static bool logged=false; if(!logged){ logged=true;
     Log("w_QueuePresentKHR live queue=%p tid=%lu waitSems=%u swapchains=%u pNext=%s (eval-driven gate)", (void*)q,

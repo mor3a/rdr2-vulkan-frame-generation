@@ -119,7 +119,7 @@ static std::atomic<uint32_t> g_evalTid{0};
 // fgvk.ini ReflexSleep=0 is the kill switch if the driver's pacing misbehaves.
 #define kReflexSleep (Cfg().reflexSleep)
 
-struct FrameSlot { sl::FrameToken* tok=nullptr; uint32_t index=0; bool submitted=false; bool simStarted=false; bool midMarkers=false; };
+struct FrameSlot { sl::FrameToken* tok=nullptr; uint32_t index=0; bool submitted=false; bool simStarted=false; bool midMarkers=false; bool presenting=false; };
 static std::mutex g_qMutex;                       // guards the ring below (eval thread vs present thread)
 static const uint32_t kQCap = 4;
 static FrameSlot g_q[kQCap]; static uint32_t g_qHead=0, g_qCount=0;   // head = next to present
@@ -130,6 +130,7 @@ static void QPop(){ if(g_qCount){ g_qHead=(g_qHead+1)%kQCap; g_qCount--; } }
 // New SL frame token (advances SL's counter) pushed as the newest slot; drops the oldest if the
 // evals are outrunning the presents (would mean two DLSS-SR evaluates per presented frame).
 static FrameSlot* QPushNew(){
+  if(g_qCount>=3 && QFront()->presenting)return nullptr;
   auto& fns = GetSlFns(); sl::FrameToken* t=nullptr;
   if(!fns.getNewFrameToken || fns.getNewFrameToken(t,nullptr)!=sl::Result::eOk || !t) return nullptr;
   if(g_qCount>=3){ static bool l=false; if(!l){ l=true; Log("frame token queue full - evals outrunning presents, dropping oldest frame %u", g_q[g_qHead].index); } QPop(); }
@@ -576,12 +577,14 @@ void NgxProbeTick(){
 // ePresentStart into latency.markerPresentFrame, which is how DLSS-G finds this frame's
 // tags+constants (guide 8.0: "markers ePresentStart/ePresentEnd must provide correct frame
 // index so that it can be matched" to the constants).
-void PresentMarkersBegin(){
+bool PresentMarkersBegin(){
   auto& fns = GetSlFns();
-  if(!fns.pclSetMarker) return;
+  if(!fns.pclSetMarker) return false;
   std::lock_guard<std::mutex> lk(g_qMutex);
   FrameSlot* f = QFront();
-  if(!f){ f = QPushNew(); if(!f) return; }   // no DLSS-SR this frame (menu/loading/video)
+  if(!f){ f = QPushNew(); if(!f) return false; }   // no DLSS-SR this frame (menu/loading/video)
+  f->presenting=true;
+  const bool ready=f->submitted;
   SimStart(*f); MidMarkers(*f);              // keep the ladder complete and ordered
   fns.pclSetMarker(sl::PCLMarker::eRenderSubmitEnd,*f->tok);
   fns.pclSetMarker(sl::PCLMarker::ePresentStart,*f->tok);   // -> latency.markerPresentFrame = this frame
@@ -590,6 +593,7 @@ void PresentMarkersBegin(){
     uint32_t p=(uint32_t)GetCurrentThreadId(), e=g_evalTid.load();
     Log("threads: present tid=%lu, DLSS-SR eval tid=%lu%s", (unsigned long)p, (unsigned long)e,
         p==e ? " (same thread)" : " (DIFFERENT threads - token hand-off is cross-thread)"); }
+  return ready;
 }
 void PresentMarkersEnd(){
   auto& fns = GetSlFns();
