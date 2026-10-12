@@ -1,0 +1,10 @@
+PUBLIC SOURCE - 0.23
+
+This package contains the public frame generation integration source.
+The update checker included in the Nexus runtime download is not included
+in this public source distribution. Building this package produces the
+frame generation mod without update checking; it does not reproduce the
+complete Nexus runtime binary byte for byte.
+
+README.txt retains the original 0.22 usage and build instructions.
+Third-party licenses and notices remain included.

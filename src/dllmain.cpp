@@ -6,7 +6,6 @@
 #include "ngx_capture.h"
 #include "inputs.h"
 #include "rdr_camera.h"
-#include "startup_guard.h"
 static bool installed=false;
 static HMODULE fgModule{};
 extern "C" __declspec(dllexport) void __cdecl RDR2FGRegisterCamera(){
@@ -22,9 +21,8 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID reserved) {
     if(_stricmp(base,"RDR2.exe")!=0) return TRUE;
     fgvk::LogInit(); fgvk::LoadConfig();
     if(!fgvk::Cfg().enabled){ fgvk::Log("FG disabled; native rendering, no diagnostic hooks"); return TRUE; }
-    if(!fgvk::BeginStartupGuard())return TRUE;
     if(!fgvk::Cfg().applicationId){ fgvk::Log("ApplicationId missing; refusing BG3 identity and leaving game untouched"); return TRUE; }
-    fgvk::Log("mor3a RDR2 Vulkan FG 0.22; provider=%s; installing early hooks",fgvk::Cfg().provider==fgvk::FGProvider::FSR3?"FSR3":"DLSSG");
+    fgvk::Log("mor3a RDR2 Vulkan FG 0.23; provider=%s; installing early hooks",fgvk::Cfg().provider==fgvk::FGProvider::FSR3?"FSR3":"DLSSG");
     if(!fgvk::InstallEarlyNgxHooks()){fgvk::Log("Early NGX routing failed; Vulkan hooks not installed");return TRUE;}
     fgvk::InstallVkHooks(); installed=true;
   }else if(reason==DLL_PROCESS_DETACH && installed && !reserved){

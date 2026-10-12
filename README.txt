@@ -1,4 +1,4 @@
-RDR2 Vulkan Frame Generation 0.22
+RDR2 Vulkan Frame Generation 0.23
 made by mor3a
 
 DLSS-G and native AMD FSR3 frame generation using RDR2's DLSS depth and motion
@@ -24,7 +24,7 @@ FG temporarily pauses while the menu is open and resumes after closing it if
 FG is enabled. Numpad * toggles FG. End cycles DLSS-G multipliers.
 The provider selector saves DLSSG or FSR3 for the next launch; changing backend
 requires a restart. Off and the frame generation checkbox apply immediately.
-DLSSGFrames=1/2/3 requests 2x/3x/4x, subject to runtime/driver support.
+DLSSGFrames=1/2 requests 2x/3x, subject to runtime/driver support.
 FSR3 is native 2x only. FSR3 3x and XeSS FG are not included.
 
 FPS COUNTER
@@ -49,8 +49,8 @@ when changed. BenchmarkFG=1 before launch enables an optional fixed-scene
 GPU SUPPORT AND LIMITATIONS
 Tested hardware: RTX 3050 Laptop, 4 GB VRAM. RTX 30 uses a private unlock core;
 RTX 40/50 skip it. RTX 20 uses an experimental Turing route and is hardware
-untested; EnableExperimentalRTX20=0 disables it. Loading an unlock does not
-prove support. FSR3 does not require the unlock. DLSS-G 4x is unvalidated.
+untested and disabled by default; EnableExperimentalRTX20=1 explicitly opts in. Loading an unlock does not
+prove support. FSR3 does not require the unlock. DLSS-G 4x is not offered in this release.
 FSRHUDCapture=1 and FSRHUDStrict=1 reduce HUD artifacts, but slight HUD ghosting
 can remain. DLSS-G did not show that artifact in the tested configuration.
 FSRHUDProtection=0 keeps the older rectangular fallback disabled.
@@ -60,9 +60,9 @@ frames can come with lower rendered FPS and increased input latency. Choose 2x
 for a lower render cost than 3x; a higher multiplier is not automatically better.
 
 TROUBLESHOOTING AND REMOVAL
-SafeStartup can skip hooks after an interrupted initialization for this build
-and provider. Read RDR2VulkanFG.log. With the game closed, SafeStartup=0 allows
-an explicit retry; restore 1 after resolving the cause. FG suspends without
+Read RDR2VulkanFG.log when reporting problems. The old SafeStartup marker no
+longer disables the mod; legacy SafeStartup INI entries are ignored.
+FG suspends without
 valid DLSS inputs during loading/menu transitions.
 To remove the mod, close the game and remove the two RDR2VulkanFG ASIs,
 RDR2VulkanFG.ini and the RDR2VulkanFG runtime folder. Restore backed-up

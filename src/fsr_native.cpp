@@ -2,7 +2,7 @@
 #include "log.h"
 #include "config.h"
 #include "menu.h"
-#include "startup_guard.h"
+
 #include "hud_capture.h"
 #include "hud_mask.h"
 #include "ffx_api/ffx_framegeneration.h"
@@ -210,7 +210,7 @@ VkResult FsrPresent(VkQueue queue,const VkPresentInfoKHR* pi,bool seen){
   }}
   bool ours=scContext && pi->swapchainCount==1 && pi->pSwapchains[0]==chain;
   VkResult result=ours?replacements.pOutQueuePresentKHR(queue,pi):((PFN_vkQueuePresentKHR)nativeGDPA(device,"vkQueuePresentKHR"))(queue,pi);
-  if(ours && (result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR) && replacements.pOutGetLastPresentCountFFXAPI){static uint64_t base=0,lastCount=0;static unsigned presents=0;auto count=replacements.pOutGetLastPresentCountFFXAPI(chain);RecordDisplayedFrames(lastCount && count>=lastCount?(uint32_t)(count-lastCount):1);lastCount=count;if(!presents)base=count;if(++presents==300){auto ratio=float(count-base)/299.f;Log("FSR3 stats: 300 presents displayed delta=%llu ratio=%.2fx",(unsigned long long)(count-base),ratio);UpdateMenuStats(1,failed?1:0,ratio);if(!failed && ratio>1.5f)CompleteStartupGuard();presents=0;}}
+  if(ours && (result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR) && replacements.pOutGetLastPresentCountFFXAPI){static uint64_t base=0,lastCount=0;static unsigned presents=0;auto count=replacements.pOutGetLastPresentCountFFXAPI(chain);RecordDisplayedFrames(lastCount && count>=lastCount?(uint32_t)(count-lastCount):1);lastCount=count;if(!presents)base=count;if(++presents==300){auto ratio=float(count-base)/299.f;Log("FSR3 stats: 300 presents displayed delta=%llu ratio=%.2fx",(unsigned long long)(count-base),ratio);UpdateMenuStats(1,failed?1:0,ratio);presents=0;}}
   return result;
 }
 }

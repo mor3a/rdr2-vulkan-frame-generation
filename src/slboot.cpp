@@ -4,7 +4,6 @@
 #include <vulkan/vulkan.h>
 #include "slboot.h"
 #include "menu.h"
-#include "startup_guard.h"
 #include "vkhooks.h"
 #include "config.h"
 #include "performance_probe.h"
@@ -285,7 +284,6 @@ void PollDLSSGState(){
   static uint32_t polls = 0, shown = 0;
   polls++; shown += st.numFramesActuallyPresented;
   if(polls >= 300){
-    if((uint32_t)st.status==0 && shown/(float)polls>1.5f)CompleteStartupGuard();
     UpdateMenuStats(g_framesMax,(uint32_t)st.status,shown/(float)polls);
     Log("FG stats: %u presents -> %u frames displayed (x%.2f) status=%u", polls, shown, shown/(double)polls, (unsigned)st.status);
     polls = 0; shown = 0;

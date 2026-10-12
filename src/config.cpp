@@ -40,7 +40,7 @@ bool PollHotkeys(){
   bool gameFocused=false;auto foreground=GetForegroundWindow();DWORD foregroundPid{};if(foreground)GetWindowThreadProcessId(foreground,&foregroundPid);gameFocused=foregroundPid==GetCurrentProcessId();
   bool toggle=Pressed(g_cfg.keyToggleFG,wT),cycle=Pressed(g_cfg.keyCycleFrames,wC);
   if(gameFocused && toggle){ g_rt.fgUserOff = !g_rt.fgUserOff; Log("hotkey: FG %s by user", g_rt.fgUserOff?"OFF":"ON"); changed=true; }
-  if(gameFocused && cycle && g_cfg.provider==FGProvider::DLSSG){ g_rt.frames = g_rt.frames>=3 ? 1 : g_rt.frames+1; Log("hotkey: generated frames -> %u (x%u)", g_rt.frames, g_rt.frames+1); changed=true; }
+  if(gameFocused && cycle && g_cfg.provider==FGProvider::DLSSG){ g_rt.frames = g_rt.frames>=2 ? 1 : g_rt.frames+1; Log("hotkey: generated frames -> %u (x%u)", g_rt.frames, g_rt.frames+1); changed=true; }
   if(changed){char path[MAX_PATH]{},value[16]{};IniPath(path,sizeof(path));snprintf(value,sizeof(value),"%u",g_rt.frames);WritePrivateProfileStringA("fgvk","DLSSGFrames",value,path);WritePrivateProfileStringA("fgvk","UserFGOff",g_rt.fgUserOff?"1":"0",path);}
   UpdateMenuRuntime(g_rt.fgUserOff,g_rt.frames);return changed;
 }
@@ -105,7 +105,7 @@ void LoadConfig(){
   GetPrivateProfileStringA("fgvk","ApplicationId","0",appid,sizeof(appid),path);
   c.applicationId = (uint32_t)strtoul(appid,nullptr,0);
   c.dlssgFrames = (uint32_t)GetPrivateProfileIntA("fgvk","DLSSGFrames",(int)c.dlssgFrames,path);
-  if(c.dlssgFrames<1) c.dlssgFrames=1; if(c.dlssgFrames>3) c.dlssgFrames=3;
+  if(c.dlssgFrames<1) c.dlssgFrames=1; if(c.dlssgFrames>2) c.dlssgFrames=2;
   if(c.provider==FGProvider::FSR3)c.dlssgFrames=1;
   c.reflexMode  = GetPrivateProfileIntA("fgvk","ReflexMode",c.reflexMode,path);
   if(c.reflexMode<0||c.reflexMode>2) c.reflexMode=2;

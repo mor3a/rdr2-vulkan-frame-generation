@@ -1,0 +1,15 @@
+0.23 - publication corrections
+
+- Removed the startup marker gate that could disable the mod and its menu.
+  Existing startup.pending files and SafeStartup settings are ignored.
+- Menu title: Frame Generation - 0.23.
+- DLSS-G controls are restricted to the previously tested 2x and 3x modes.
+- Experimental RTX 20 unlock is disabled by default in the distributed INI.
+- Nexus runtime only: background version check for Nexus mod 10997.
+  It accepts published pages only and remains silent on errors or equal versions.
+  The public source distribution does not include the update checker.
+
+Validation: runtime compiled with 8 contract, 3 ABI, 5 FPS and 13 Nexus response
+checks passing. Public source compiled separately with its 16 checks passing.
+Existing VALIDATION.txt records the previous 0.22 game and performance tests.
+These checks do not prove all GPUs or game configurations are supported.

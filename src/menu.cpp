@@ -91,7 +91,7 @@ void MenuBuildUI(){
   if(open){
     ImGui::SetNextWindowPos({(ImGui::GetIO().DisplaySize.x-460)/2,(ImGui::GetIO().DisplaySize.y-430)/2},ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize({460,430},ImGuiCond_FirstUseEver);
-    bool visible=true;ImGui::Begin("Frame Generation",&visible,ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoCollapse);
+    bool visible=true;ImGui::Begin("Frame Generation - 0.23",&visible,ImGuiWindowFlags_NoResize|ImGuiWindowFlags_NoCollapse);
     ImGui::TextDisabled("RDR2 / Vulkan");ImGui::TextWrapped("%s",GPUName());ImGui::Separator();
     auto pendingRequest=request.load();auto r=pendingRequest?(pendingRequest&15):runtime.load();bool enabled=(r&1)==0;int mode=int(r>>1)-1;
     if(ImGui::Checkbox("Frame generation",&enabled))request=0x100|((mode+1)<<1)|(enabled?0:1);
@@ -102,8 +102,8 @@ void MenuBuildUI(){
       else{nextProvider=selection;SaveNextProvider(selection==1?FGProvider::FSR3:FGProvider::DLSSG);if(selection==(fsr?1:0))request=0x100|((mode+1)<<1);}
     }
     if(nextProvider!=(fsr?1:0))ImGui::TextColored({1,.76f,.3f,1},"Restart game to apply %s",nextProvider==1?"FSR3":"DLSS-G");else ImGui::TextDisabled("Active: %s",fsr?"FSR3":"DLSS-G");
-    const char* modes[]={"2x","3x","4x"};if(fsr)mode=0;
-    ImGui::BeginDisabled(fsr);ImGui::SetNextItemWidth(280);if(ImGui::Combo("Multiplier",&mode,modes,3))request=0x100|((mode+1)<<1)|(enabled?0:1);ImGui::EndDisabled();
+    const char* modes[]={"2x","3x"};if(fsr)mode=0;
+    ImGui::BeginDisabled(fsr);ImGui::SetNextItemWidth(280);if(ImGui::Combo("Multiplier",&mode,modes,2))request=0x100|((mode+1)<<1)|(enabled?0:1);ImGui::EndDisabled();
     if(fsr)ImGui::TextDisabled("FSR3 supports 2x");
     ImGui::TextDisabled("FG pauses while this menu is open");
     if(ImGui::Checkbox("Show FPS counter",&showFPS))SaveFPSCounter(showFPS);

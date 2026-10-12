@@ -30,7 +30,7 @@ $flags=@('c++','-std=c++17','-O2',"-ffile-prefix-map=$PSScriptRoot=.","-ffile-pr
   "-I$(Join-Path $DependencyRoot 'Streamline-2.12/include')",
   "-I$(Join-Path $DependencyRoot 'Detours/src')","-I$(Join-Path $PSScriptRoot 'src')")
 $flags+=@("-I$(Join-Path $PSScriptRoot 'vendor/imgui')","-I$(Join-Path $PSScriptRoot 'vendor')")
-$src=@('dllmain.cpp','log.cpp','config.cpp','vkhooks.cpp','slboot.cpp','inputs.cpp','ngx_capture.cpp','ngx_capture.S','ampere_boot.cpp','rdr_camera.cpp','menu.cpp','fsr_native.cpp','startup_guard.cpp','hud_capture.cpp','hud_mask.cpp','performance_probe.cpp') | ForEach-Object {Join-Path $PSScriptRoot "src/$_"}
+$src=@('dllmain.cpp','log.cpp','config.cpp','vkhooks.cpp','slboot.cpp','inputs.cpp','ngx_capture.cpp','ngx_capture.S','ampere_boot.cpp','rdr_camera.cpp','menu.cpp','fsr_native.cpp','hud_capture.cpp','hud_mask.cpp','performance_probe.cpp') | ForEach-Object {Join-Path $PSScriptRoot "src/$_"}
 $src+=@('imgui.cpp','imgui_draw.cpp','imgui_tables.cpp','imgui_widgets.cpp','imgui_impl_win32.cpp','imgui_impl_dx11.cpp') | ForEach-Object {Join-Path $PSScriptRoot "vendor/imgui/$_"}
 $src=$src | Where-Object {$_ -notlike '*imgui_impl_dx11.cpp'}
 $src+=@(Join-Path $PSScriptRoot 'src/menu_vulkan.cpp'),(Join-Path $PSScriptRoot 'vendor/imgui/imgui_impl_vulkan.cpp')
