@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D currentColor;
+layout(set = 0, binding = 1) uniform sampler2D hudlessColor;
+layout(set = 0, binding = 2) uniform sampler2D generatedColor;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D restoredColor;
+layout(push_constant) uniform Params { uint width; uint height; uint swizzleBGRA; } params;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(params.width) || p.y >= int(params.height)) return;
+    ivec2 size = ivec2(params.width, params.height);
+    vec3 centerReal = texelFetch(currentColor, p, 0).rgb;
+    bool changed = false;
+    for (int y = -1; y <= 1 && !changed; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            ivec2 q = clamp(p + ivec2(x, y), ivec2(0), size - 1);
+            vec3 a = texelFetch(currentColor, q, 0).rgb;
+            vec3 b = texelFetch(hudlessColor, q, 0).rgb;
+            if (max(max(abs(a.r-b.r), abs(a.g-b.g)), abs(a.b-b.b)) > (0.5 / 255.0)) { changed = true; break; }
+        }
+    }
+    vec4 color = changed ? texelFetch(currentColor, p, 0) : texelFetch(generatedColor, p, 0);
+    if (params.swizzleBGRA != 0) color = color.bgra;
+    imageStore(restoredColor, p, color);
+}
