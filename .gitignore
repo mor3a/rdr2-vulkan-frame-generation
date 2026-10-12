@@ -1,0 +1,8 @@
+*.asi
+*.dll
+*.pdb
+*.log
+startup.pending
+installed-files.json
+work/
+outputs/
