@@ -1,0 +1,7 @@
+RDR2 Vulkan Frame Generation
+Created by mor3a.
+
+Development assistance was provided by ChatGPT (OpenAI) and Claude (Anthropic).
+
+Third-party components retain their respective copyrights and license terms.
+See the licenses directory for third-party notices.
