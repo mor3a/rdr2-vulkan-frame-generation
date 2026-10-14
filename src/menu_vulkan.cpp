@@ -1,4 +1,6 @@
 #include "menu.h"
+#include "swapchain_lock.h"
+#include "menu_startup.h"
 #include "log.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -22,6 +24,18 @@ static VkSwapchainKHR chain{};static VkExtent2D extent{};static VkFormat format{
 static VkRenderPass renderPass{};static VkCommandPool commandPool{};static std::vector<Frame> frames;
 static PFN_vkGetDeviceProcAddr nativeGDPA{};static PFN_vkGetSwapchainImagesKHR gameImages{};
 static bool rendererReady{},disabled{};
+static MenuStartup startup;
+static std::vector<VkImage> capturedImages;
+void MenuCaptureImages(VkDevice d,VkSwapchainKHR sc,uint32_t count,const VkImage* images){
+  SwapchainScope lifecycle;
+  if(d!=device || sc!=chain || rendererReady || !images || count<2 || count>8)return;
+  capturedImages.assign(images,images+count);
+  Log("Vulkan menu: captured %u images returned to the game",count);
+}
+void MenuPresentCompleted(bool evaluated,VkResult result){
+  SwapchainScope lifecycle;
+  startup.Presented(evaluated,result==VK_SUCCESS || result==VK_SUBOPTIMAL_KHR);
+}
 static PFN_vkVoidFunction LoadFunction(const char* name,void*){
   auto fn=nativeGDPA?nativeGDPA(device,name):nullptr;
   if(!fn)fn=(PFN_vkVoidFunction)GetProcAddress(GetModuleHandleW(L"vulkan-1.dll"),name);
@@ -30,16 +44,25 @@ static PFN_vkVoidFunction LoadFunction(const char* name,void*){
 static bool Check(VkResult r,const char* what){if(r==VK_SUCCESS)return true;Log("Vulkan menu: %s failed=%d; native game present retained",what,r);return false;}
 static void BackendError(VkResult r){if(r!=VK_SUCCESS)Log("ImGui Vulkan result=%d",r);}
 void MenuDestroySwapchain(VkDevice d,VkSwapchainKHR sc){
+  LogDebug("overlay teardown requested: device=%p swapchain=%p",(void*)d,(void*)sc);
+  SwapchainScope lifecycle;
   if(d!=device || (sc && sc!=chain))return;
+  startup.Reset();
   MenuRendererAvailable(false);
-  if(vk.DeviceWaitIdle)vk.DeviceWaitIdle(device);
+  // Registration alone owns no GPU work. Waiting for the whole device here
+  // can stall startup even though there is no overlay resource to retire.
+  if((rendererReady || commandPool || renderPass || !frames.empty()) && vk.DeviceWaitIdle){LogDebug("overlay GPU idle wait begin: frames=%u",(unsigned)frames.size());auto result=vk.DeviceWaitIdle(device);LogDebug("overlay GPU idle wait end: result=%d",(int)result);}
   if(rendererReady){ImGui_ImplVulkan_Shutdown();rendererReady=false;}
   for(auto& f:frames){if(f.framebuffer)vk.DestroyFramebuffer(device,f.framebuffer,nullptr);if(f.view)vk.DestroyImageView(device,f.view,nullptr);if(f.ready)vk.DestroySemaphore(device,f.ready,nullptr);if(f.fence)vk.DestroyFence(device,f.fence,nullptr);}
   frames.clear();if(commandPool)vk.DestroyCommandPool(device,commandPool,nullptr);if(renderPass)vk.DestroyRenderPass(device,renderPass,nullptr);
+  capturedImages.clear();
   commandPool={};renderPass={};chain={};disabled=false;
+  LogDebug("overlay teardown completed");
 }
 void MenuRegisterSwapchain(VkDevice d,VkPhysicalDevice pd,VkInstance inst,uint32_t queueFamily,VkSwapchainKHR sc,const VkSwapchainCreateInfoKHR* ci,PFN_vkGetDeviceProcAddr gdpa,PFN_vkGetSwapchainImagesKHR images){
+  SwapchainScope lifecycle;
   if(chain)MenuDestroySwapchain(device,chain);
+  startup.Reset();
   device=d;physical=pd;instance=inst;family=queueFamily;chain=sc;extent=ci->imageExtent;format=ci->imageFormat;nativeGDPA=gdpa;gameImages=images;disabled=false;
   if(!(ci->imageUsage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) || ci->imageArrayLayers!=1){disabled=true;Log("Vulkan menu: unsupported swapchain usage/layers; game unaffected");return;}
 #define LOAD(n) vk.n=(PFN_vk##n)nativeGDPA(device,"vk" #n);if(!vk.n){disabled=true;Log("Vulkan menu: missing vk" #n);return;}
@@ -49,8 +72,10 @@ void MenuRegisterSwapchain(VkDevice d,VkPhysicalDevice pd,VkInstance inst,uint32
 }
 static bool Initialize(VkQueue queue){
   if(!MenuInitializeUI() || !gameImages)return false;
-  uint32_t count{};if(!Check(gameImages(device,chain,&count,nullptr),"image query") || count<2 || count>8)return false;
-  std::vector<VkImage> images(count);if(!Check(gameImages(device,chain,&count,images.data()),"images"))return false;
+  // Use the images already returned to the host. A later proxy query can expose
+  // a different set after FG options change, which the host does not render into.
+  if(capturedImages.empty())return false;
+  std::vector<VkImage> images=capturedImages;uint32_t count=(uint32_t)images.size();
   VkAttachmentDescription attachment{};attachment.format=format;attachment.samples=VK_SAMPLE_COUNT_1_BIT;attachment.loadOp=VK_ATTACHMENT_LOAD_OP_LOAD;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;attachment.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;attachment.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;attachment.initialLayout=attachment.finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
   VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=1;sub.pColorAttachments=&ref;
   VkSubpassDependency dependencies[2]{};dependencies[0].srcSubpass=VK_SUBPASS_EXTERNAL;dependencies[0].dstSubpass=0;dependencies[0].srcStageMask=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;dependencies[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;dependencies[0].srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;dependencies[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -77,7 +102,12 @@ static bool Initialize(VkQueue queue){
   rendererReady=true;MenuRendererAvailable(true);Log("Vulkan menu renderer initialized: %u game images",count);return true;
 }
 bool MenuRender(VkQueue queue,const VkPresentInfoKHR* original,VkPresentInfoKHR& modified){
+  SwapchainScope lifecycle;
   if(disabled || !chain || !original || original->swapchainCount!=1 || original->pSwapchains[0]!=chain)return false;
+  // Do not allocate the overlay or upload fonts on startup/loading presents.
+  // The backend must first complete a present with real DLSS inputs.
+  if(!startup.ready)return false;
+  if(capturedImages.empty())return false;
   if(!rendererReady && !Initialize(queue)){disabled=true;MenuRendererAvailable(false);Log("Vulkan menu initialization failed; rendering skipped");return false;}
   if(!MenuHasDrawing())return false;
   uint32_t index=original->pImageIndices[0];if(index>=frames.size())return false;auto& f=frames[index];

@@ -1,10 +1,8 @@
-PUBLIC SOURCE - 0.23
+PUBLIC SOURCE - 0.30
 
-This package contains the public frame generation integration source.
-The update checker included in the Nexus runtime download is not included
-in this public source distribution. Building this package produces the
-frame generation mod without update checking; it does not reproduce the
-complete Nexus runtime binary byte for byte.
-
-README.txt retains the original 0.22 usage and build instructions.
-Third-party licenses and notices remain included.
+Public frame generation integration source based on the 0.30 branch.
+The Nexus runtime update checker is excluded and replaced with a no-network stub.
+Public builds do not reproduce the complete Nexus runtime binary byte for byte.
+The 0.31beta compatibility experiment and 0.40beta camera experiment are not included.
+Main downloads: https://www.nexusmods.com/reddeadredemption2/mods/10997
+Third-party licenses and acknowledgements are preserved.

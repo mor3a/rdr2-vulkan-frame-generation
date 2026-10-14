@@ -6,3 +6,7 @@ startup.pending
 installed-files.json
 work/
 outputs/
+
+*.exe
+*.lib
+!vendor/d3dcompiler.lib

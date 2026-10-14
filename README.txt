@@ -1,25 +1,30 @@
-RDR2 Vulkan Frame Generation 0.23
+RDR2 Vulkan Frame Generation 0.30
 made by mor3a
+
+Main downloads and updates: https://www.nexusmods.com/reddeadredemption2/mods/10997
+This repository contains public source code and issue tracking.
 
 DLSS-G and native AMD FSR3 frame generation using RDR2's DLSS depth and motion
 vectors. This is a beta RDR2 integration, not a universal Vulkan game mod.
 Use Vulkan, DLSS enabled, SDR and Story Mode.
 
 MANUAL INSTALLATION
-Close RDR2. Back up files with matching names. Copy the two ASI files,
-RDR2VulkanFG runtime folder, version.dll, version.ini and RDR2VulkanFG.ini
-beside RDR2.exe. Preserve your existing INI when updating, but use
-PresentPacing=0, OffAfterIdleFrames=3 and NoDLSSGraceMs=100 for this release's
-optimized settings. No executable changes or installation script are required.
-Check for ASI loader conflicts before replacing an existing version.dll.
-The camera helper requires ScriptHookRDR2 and its compatible dinput8.dll loader;
-these are not bundled. Obtain them from the original author:
+Close RDR2. For a clean update, remove the previous RDR2VulkanFG ASI files,
+INI and runtime folder, then copy both ASI files, RDR2VulkanFG runtime folder
+and RDR2VulkanFG.ini from the Nexus download beside RDR2.exe.
+Keep your existing ASI loader and compatible ScriptHookRDR2 installation.
+Remove version.dll or winmm.dll only if they came from an older release of
+this mod. Preserve files required by other mods.
+Obtain ScriptHookRDR2 from its original author:
 http://www.dev-c.com/rdr2/scripthookrdr2/
 
 MENU AND CONTROLS
 Insert opens/closes the draggable menu inside the game's Vulkan image.
 Drag the title bar to move it. The GPU model and unlock details are displayed.
-The footer reads made by mor3a. No separate desktop menu window is created.
+The footer reads made by mor3a
+
+Main downloads and updates: https://www.nexusmods.com/reddeadredemption2/mods/10997
+This repository contains public source code and issue tracking.. No separate desktop menu window is created.
 FG temporarily pauses while the menu is open and resumes after closing it if
 FG is enabled. Numpad * toggles FG. End cycles DLSS-G multipliers.
 The provider selector saves DLSSG or FSR3 for the next launch; changing backend
@@ -28,10 +33,10 @@ DLSSGFrames=1/2 requests 2x/3x, subject to runtime/driver support.
 FSR3 is native 2x only. FSR3 3x and XeSS FG are not included.
 
 FPS COUNTER
-The menu enables text in the top-right corner without a background box.
+The menu enables an FPS counter in the top-right corner.
 With FG off it shows rendered FPS; with working FG it shows rendered /
 displayed FPS. It samples game presents and backend counters rather than
-ImGui's refresh rate. Missing telemetry is shown as --. A requested multiplier
+ImGui's refresh rate. Brief telemetry gaps retain the last measured value. Sustained loss is shown as --. A requested multiplier
 alone is not proof of actual generated frames.
 
 OPTIMIZATIONS
@@ -79,3 +84,7 @@ and licenses under licenses and the runtime folder.
 Upstream unlock: https://github.com/mcsoderh/RTX30MFG-Unlock/releases/tag/v1.2.2
 
 Known UI limitation: transient text artifacts may appear during menu changes. See VALIDATION.txt for the tested scope.
+
+PUBLIC SOURCE
+The Nexus runtime update checker is excluded. This source builds without update checking.
+Menu settings include an FPS limit and a configurable menu hotkey.

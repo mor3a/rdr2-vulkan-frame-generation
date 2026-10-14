@@ -6,6 +6,10 @@
 #include "inputs.h"
 #include "config.h"
 #include "presentpacer.h"
+#include "present_compat.h"
+#include "present_route.h"
+#include <mutex>
+#include <algorithm>
 #include <windows.h>
 #include <detours.h>
 #include <intrin.h>
@@ -17,9 +21,11 @@
 #include "resource_state.h"
 #include "ampere_boot.h"
 #include "menu.h"
+#include "swapchain_lock.h"
 #include "fsr_native.h"
 #include "hud_capture.h"
 #include "performance_probe.h"
+#include "vulkan_owner.h"
 
 namespace fgvk {
 static bool CallerIsStreamline(void*);
@@ -29,6 +35,9 @@ VkPhysicalDevice gPhysicalDevice{};
 VkDevice gDevice{};
 VkQueue gGraphicsQueue{};
 uint32_t gGraphicsFamily{};
+static VulkanOwner g_owner;
+static std::atomic<VkInstance> g_ownedInstance{nullptr};
+static std::atomic<VkDevice> g_ownedDevice{nullptr};
 
 // watchdog: counters + a position marker naming the in-flight call (inputs.cpp writes g_wdEvals/g_wdPos)
 std::atomic<uint32_t> g_wdPresents{0};
@@ -50,26 +59,10 @@ struct PosScope {
   ~PosScope(){ if(on){ g_wdPos.store(prev); g_wdPosSinceUs.store(NowUs()); } }
 };
 
-// On a stall the watchdog spawns fgvk-stack.exe (next to this DLL) to dump every thread's stack
-// out-of-process into bin\fgvk-stacks.log - the only way to see what the present thread and
-// Streamline's pacer are blocked on inside the driver.
-static void SpawnStackDump(const char* tag){
-  char dll[MAX_PATH]{}; HMODULE self{};
-  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)&SpawnStackDump,&self);
-  GetModuleFileNameA(self, dll, MAX_PATH); char* s=strrchr(dll,'\\'); if(s) *(s+1)=0;
-  char exe[MAX_PATH]{}; GetModuleFileNameA(nullptr, exe, MAX_PATH); s=strrchr(exe,'\\'); if(s) *(s+1)=0;
-  char tool[MAX_PATH]; snprintf(tool,sizeof(tool),"%sfgvk-stack.exe", dll);
-  if(GetFileAttributesA(tool)==INVALID_FILE_ATTRIBUTES){ Log("wd: stack dump (%s) skipped - fgvk-stack.exe is not next to fgvk.dll (developer tool, see BUILD.md)", tag); return; }
-  char cmd[1024]; snprintf(cmd,sizeof(cmd),"\"%s\" %lu \"%sfgvk-stacks.log\"", tool, GetCurrentProcessId(), exe);
-  STARTUPINFOA si{}; si.cb=sizeof(si); PROCESS_INFORMATION pi{};
-  BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-  Log("wd: stack dump (%s) -> %s%s", tag, ok?"spawned ":"CreateProcess failed ", ok?cmd:"");
-  if(ok){ CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-}
-
 static void StartWatchdog(){
   static std::atomic<bool> started{false};
   bool exp=false; if(!started.compare_exchange_strong(exp,true)) return;
+  StartDiagnosticCollector();
   std::thread([]{
     uint32_t lastP=0; int stalledTicks=0; int dumps=0;
     for(;;){ Sleep(2000);
@@ -80,7 +73,7 @@ static void StartWatchdog(){
       Log("wd: presents=%u evals=%u pos=%d (%.1fs there) gen=%d%s", p,e,pos,inPos,(int)g_genOn.load(),stalled?" STALLED":"");
       stalledTicks = stalled ? stalledTicks+1 : 0;
       // first dump after ~6s of no presents, a second one ~10s later to see what moved
-      if(p>0 && ((stalledTicks==3 && dumps==0) || (stalledTicks==8 && dumps==1))){ dumps++; SpawnStackDump(dumps==1?"first":"second"); }
+      if(p>0 && ((stalledTicks==3 && dumps==0) || (stalledTicks==8 && dumps==1))){ dumps++; if(DebugLoggingEnabled()){Log("Debug: requesting external thread stacks for stalled presentation");RequestDiagnosticStacks();} }
       lastP=p; }
   }).detach();
 }
@@ -137,6 +130,7 @@ static PFN_vkGetDeviceProcAddr   ip_GDPA{};
 // Interposer targets we thin-wrap (resolved lazily via the interposer's GIPA/GDPA).
 static PFN_vkCreateInstance     t_CreateInstance{};
 static PFN_vkCreateDevice       t_CreateDevice{};
+static PFN_vkQueuePresentKHR    o_QueuePresentKHR_export{};   // real loader present (trampoline once hooked)
 static PFN_vkQueuePresentKHR    t_QueuePresentKHR{};
 static PFN_vkCreateSwapchainKHR t_CreateSwapchainKHR{};
 
@@ -192,8 +186,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL h_CreateDeviceExport(VkPhysicalDevice pd, 
     if(t_CreateDevice)return w_CreateDevice(pd,ci,a,out);
   }
   int prevReentry = g_loaderCreateReentry; g_loaderCreateReentry = g_reentry;
+  if(ci){Log("native device forwarding: queueInfos=%u extensions=%u flags=0x%x",ci->queueCreateInfoCount,ci->enabledExtensionCount,ci->flags);
+    for(uint32_t i=0;i<ci->queueCreateInfoCount;++i){auto& queue=ci->pQueueCreateInfos[i];Log("native queue[%u]: family=%u count=%u flags=0x%x",i,queue.queueFamilyIndex,queue.queueCount,queue.flags);for(uint32_t j=0;j<i;++j)if(ci->pQueueCreateInfos[j].queueFamilyIndex==queue.queueFamilyIndex && ci->pQueueCreateInfos[j].flags==queue.flags)Log("WARNING: duplicate native queue family=%u flags=0x%x",queue.queueFamilyIndex,queue.flags);}
+    for(uint32_t i=0;i<ci->enabledExtensionCount;++i)Log("native device extension[%u]=%s",i,ci->ppEnabledExtensionNames[i]);}
   ++g_loaderCreateDevice; VkResult r = o_CreateDevice_export(pd, ci, a, out); --g_loaderCreateDevice;
-  g_loaderCreateReentry = prevReentry; return r;
+  g_loaderCreateReentry = prevReentry;Log("native device forwarding return=%d",(int)r); return r;
 }
 static void InstallCreateDeviceExportHook(){
   static bool done=false; if(done) return; done=true;
@@ -223,6 +220,13 @@ static void EnsureSlAndInterposer(){
 
 static VKAPI_ATTR VkResult VKAPI_CALL w_CreateInstance(
     const VkInstanceCreateInfo* ci, const VkAllocationCallbacks* a, VkInstance* out){
+  if(!g_owner.ClaimInstance()){
+    Reentry guard;
+    auto r=o_CreateInstance_export?o_CreateInstance_export(ci,a,out):VK_ERROR_INITIALIZATION_FAILED;
+    Log("Auxiliary Vulkan instance uses native dispatch: result=%d instance=%p; FG owner preserved",(int)r,r==VK_SUCCESS?(void*)*out:nullptr);
+    return r;
+  }
+  StartDiagnosticCollector();LogModules();
   InstallCreateDeviceExportHook();   // late attach: after other mods' load-time hooks, so ours is outermost
   EnsureSlAndInterposer();   // slInit here (loader lock released), NOT in the GIPA resolve
   // Resolve the interposer's vkCreateInstance now that SL is initialized.
@@ -231,10 +235,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_CreateInstance(
     Log("No active interposer; falling back to the Vulkan loader");
     auto nativeCreate=o_CreateInstance_export;
     auto r=nativeCreate?nativeCreate(ci,a,out):VK_ERROR_INITIALIZATION_FAILED;
-    if(r==VK_SUCCESS)gInstance=*out;return r;
+    if(r==VK_SUCCESS){gInstance=*out;g_ownedInstance.store(*out);}else g_owner.InstanceFailed();return r;
   }
   VkResult r; { Reentry _; r = t_CreateInstance(ci, a, out); }
-  if (r == VK_SUCCESS){ gInstance = *out; Log("w_CreateInstance ok instance=%p", (void*)gInstance); }
+  if (r == VK_SUCCESS){ gInstance = *out;g_ownedInstance.store(*out); Log("w_CreateInstance ok instance=%p", (void*)gInstance); }
+  else g_owner.InstanceFailed();
   return r;
 }
 static VKAPI_ATTR VkResult VKAPI_CALL h_CreateInstanceExport(const VkInstanceCreateInfo* ci,const VkAllocationCallbacks* a,VkInstance* out){
@@ -242,10 +247,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL h_CreateInstanceExport(const VkInstanceCre
   return w_CreateInstance(ci,a,out);
 }
 
+static bool PhysicalDeviceBelongs(PFN_vkGetInstanceProcAddr gipa, VkInstance inst, VkPhysicalDevice pd){
+  if(!gipa || !inst || !pd) return false;
+  Reentry guard;
+  auto enumerate=(PFN_vkEnumeratePhysicalDevices)gipa(inst,"vkEnumeratePhysicalDevices");
+  uint32_t count=0;
+  if(!enumerate || enumerate(inst,&count,nullptr)!=VK_SUCCESS || !count || count>64) return false;
+  std::vector<VkPhysicalDevice> devices(count);
+  auto r=enumerate(inst,&count,devices.data());
+  if(r!=VK_SUCCESS && r!=VK_INCOMPLETE) return false;
+  for(uint32_t i=0;i<count && i<devices.size();++i) if(devices[i]==pd) return true;
+  return false;
+}
 static void ResolvePacer(VkDevice dev);
 static VKAPI_ATTR VkResult VKAPI_CALL w_CreateDevice(
     VkPhysicalDevice pd, const VkDeviceCreateInfo* ci,
     const VkAllocationCallbacks* a, VkDevice* out){
+  // Physical-device handles belong to an instance. Reserve the game's device
+  // before calling the driver so overlapping helper creation stays native.
+  auto owner=g_ownedInstance.load();
+  bool belongs=PhysicalDeviceBelongs(o_GIPA,owner,pd) || PhysicalDeviceBelongs(ip_GIPA,gInstance,pd);
+  if(!belongs || !g_owner.ClaimDevice()){
+    Reentry guard;auto r=o_CreateDevice_export?o_CreateDevice_export(pd,ci,a,out):VK_ERROR_INITIALIZATION_FAILED;
+    Log("Auxiliary Vulkan device uses native dispatch: physical=%p result=%d device=%p; FG owner preserved",(void*)pd,(int)r,r==VK_SUCCESS?(void*)*out:nullptr);
+    return r;
+  }
+  struct Reservation {bool committed=false;~Reservation(){if(!committed)g_owner.DeviceFailed();}} reservation;
+  LogDebug("device create begin: physical=%p queueInfos=%u extensions=%u flags=0x%x",(void*)pd,ci->queueCreateInfoCount,ci->enabledExtensionCount,ci->flags);
+  for(uint32_t i=0;i<ci->queueCreateInfoCount;++i){const auto& q=ci->pQueueCreateInfos[i];LogDebug("device requested queue[%u]: family=%u count=%u flags=0x%x",i,q.queueFamilyIndex,q.queueCount,q.flags);}
   // RDR2 can enumerate physical devices via a cached native/export entry point.
   // SL's vkCreateDevice indexes instanceDeviceMap[physicalDevice]; without the
   // intercepted enumeration this inserts a NULL instance and its plugins call
@@ -269,11 +298,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_CreateDevice(
   // Interposer owns the device (its own surgery/queues). We only capture + kick off SL setup.
   VkDeviceCreateInfo planned{};const VkDeviceCreateInfo* selected=ci;
   if(Cfg().provider==FGProvider::FSR3 && FsrPlanDevice(gInstance,pd,ci,planned))selected=&planned;
+  if(ip_GIPA){ Reentry guard; auto resolved=(PFN_vkCreateDevice)ip_GIPA(gInstance,"vkCreateDevice"); if(resolved) t_CreateDevice=resolved; }
   VkResult r; { Reentry _; r = t_CreateDevice(pd, selected, a, out); }
   if(r!=VK_SUCCESS && selected!=ci){FsrDisable();Log("FSR3 device feature request failed=%d; retrying original native device",r);Reentry guard;r=t_CreateDevice(pd,ci,a,out);}
   if (r == VK_SUCCESS){
-    gPhysicalDevice = pd; gDevice = *out;
-    {auto vk=GetModuleHandleW(L"vulkan-1.dll");auto props=(PFN_vkGetPhysicalDeviceProperties)GetProcAddress(vk,"vkGetPhysicalDeviceProperties");if(props){VkPhysicalDeviceProperties info{};props(pd,&info);SetGpuInfo(info);}}
+    gPhysicalDevice = pd; gDevice = *out;g_ownedDevice.store(*out);reservation.committed=true;
+    {auto vk=GetModuleHandleW(L"vulkan-1.dll");auto props=(PFN_vkGetPhysicalDeviceProperties)GetProcAddress(vk,"vkGetPhysicalDeviceProperties");if(props){VkPhysicalDeviceProperties info{};props(pd,&info);SetGpuInfo(info);LogDebug("GPU Vulkan details: vendor=0x%x device=0x%x api=%u.%u.%u driverRaw=0x%x",info.vendorID,info.deviceID,VK_VERSION_MAJOR(info.apiVersion),VK_VERSION_MINOR(info.apiVersion),VK_VERSION_PATCH(info.apiVersion),info.driverVersion);}
+    auto queues=(PFN_vkGetPhysicalDeviceQueueFamilyProperties)GetProcAddress(vk,"vkGetPhysicalDeviceQueueFamilyProperties");if(queues){uint32_t count=0;queues(pd,&count,nullptr);if(count && count<=64){std::vector<VkQueueFamilyProperties> families(count);queues(pd,&count,families.data());for(uint32_t i=0;i<count&&i<families.size();++i)LogDebug("GPU available queue family[%u]: count=%u flags=0x%x",i,families[i].queueCount,families[i].queueFlags);}}}
     for (uint32_t i=0;i<ci->queueCreateInfoCount;i++){ gGraphicsFamily = ci->pQueueCreateInfos[i].queueFamilyIndex; break; }
     Log("w_CreateDevice ok device=%p phys=%p gfxFamily=%u", (void*)gDevice,(void*)pd,gGraphicsFamily);
     if(Cfg().provider==FGProvider::FSR3)FsrDeviceReady(gDevice,NativeBackendGDPA);
@@ -283,10 +314,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_CreateDevice(
   return r;
 }
 
+static void TrackOwnedSwapchain(VkSwapchainKHR sc);
+static void UntrackOwnedSwapchain(VkSwapchainKHR sc);
+static PresentRoute RouteForPresent(const VkPresentInfoKHR* pi);
 static VKAPI_ATTR VkResult VKAPI_CALL w_CreateSwapchainKHR(
     VkDevice dev, const VkSwapchainCreateInfoKHR* ci,
     const VkAllocationCallbacks* a, VkSwapchainKHR* out){
-  if(Cfg().provider==FGProvider::FSR3){Reentry guard;MenuDestroySwapchain(dev,VK_NULL_HANDLE);auto r=FsrCreateSwapchain(dev,ci,a,out);if(r==VK_SUCCESS)MenuRegisterSwapchain(dev,gPhysicalDevice,gInstance,gGraphicsFamily,*out,ci,NativeBackendGDPA,(PFN_vkGetSwapchainImagesKHR)FsrOverride("vkGetSwapchainImagesKHR"));return r;}
+  SwapchainScope lifecycle;
+  if(Cfg().provider==FGProvider::FSR3){Reentry guard;auto r=FsrCreateSwapchain(dev,ci,a,out);if(r==VK_SUCCESS){TrackOwnedSwapchain(*out);MenuRegisterSwapchain(dev,gPhysicalDevice,gInstance,gGraphicsFamily,*out,ci,NativeBackendGDPA,(PFN_vkGetSwapchainImagesKHR)FsrOverride("vkGetSwapchainImagesKHR"));}return r;}
   // GAME'S EXACT swapchain (PureDark parity - his log: 'created original SwapChain'). The
   // earlier 7-image bump likely broke HW flip metering (shallow flip-queue depth limits) ->
   // 'FC feedback' warnings -> CPU-pacer fallback whose 100ms semaphore waits are the freeze.
@@ -296,15 +331,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL w_CreateSwapchainKHR(
         ci->imageExtent.width, ci->imageExtent.height, (int)ci->imageFormat,
         (int)ci->presentMode, ci->minImageCount); }
   GateOffForSwapchain();
-  MenuDestroySwapchain(dev,VK_NULL_HANDLE);
   VkResult r; { Reentry _; r = t_CreateSwapchainKHR(dev, ci, a, out); }
-  if(r==VK_SUCCESS){Reentry guard;auto getter=(PFN_vkGetSwapchainImagesKHR)ip_GDPA(dev,"vkGetSwapchainImagesKHR");MenuRegisterSwapchain(dev,gPhysicalDevice,gInstance,gGraphicsFamily,*out,ci,NativeBackendGDPA,getter);}
+  if(r==VK_SUCCESS){TrackOwnedSwapchain(*out);Reentry guard;auto getter=(PFN_vkGetSwapchainImagesKHR)ip_GDPA(dev,"vkGetSwapchainImagesKHR");MenuRegisterSwapchain(dev,gPhysicalDevice,gInstance,gGraphicsFamily,*out,ci,NativeBackendGDPA,getter);}
   static bool l2=false; if(!l2){ l2=true; Log("w_CreateSwapchainKHR -> %d sc=%p", (int)r, out?(void*)*out:nullptr); }
   return r;
 }
 
 // PresentPacing (see presentpacer.h): resolved once per device through the interposer, used on
 // the present thread only. Stats go to the log every 600 paced frames.
+static std::mutex g_ownedSwapchainsMutex;
+static std::vector<VkSwapchainKHR> g_ownedSwapchains;
+static void TrackOwnedSwapchain(VkSwapchainKHR sc){
+  if(!sc) return;
+  std::lock_guard<std::mutex> lock(g_ownedSwapchainsMutex);
+  if(std::find(g_ownedSwapchains.begin(),g_ownedSwapchains.end(),sc)==g_ownedSwapchains.end())g_ownedSwapchains.push_back(sc);
+}
+static void UntrackOwnedSwapchain(VkSwapchainKHR sc){
+  std::lock_guard<std::mutex> lock(g_ownedSwapchainsMutex);
+  g_ownedSwapchains.erase(std::remove(g_ownedSwapchains.begin(),g_ownedSwapchains.end(),sc),g_ownedSwapchains.end());
+}
+static PresentRoute RouteForPresent(const VkPresentInfoKHR* pi){
+  if(!pi) return PresentRoute::FrameGeneration;
+  std::lock_guard<std::mutex> lock(g_ownedSwapchainsMutex);
+  bool anyKnown=false;
+  for(uint32_t i=0;i<pi->swapchainCount;++i)
+    if(std::find(g_ownedSwapchains.begin(),g_ownedSwapchains.end(),pi->pSwapchains[i])!=g_ownedSwapchains.end()){anyKnown=true;break;}
+  return RoutePresent(g_ownedSwapchains.empty(),anyKnown,pi->swapchainCount);
+}
 static PacerVk g_pacerVk{};
 static PresentPacer g_pacer;
 static void ResolvePacer(VkDevice dev){
@@ -317,7 +370,7 @@ static void ResolvePacer(VkDevice dev){
   vk.waitForFences  = (PFN_vkWaitForFences)ip_GDPA(dev,"vkWaitForFences");
   vk.queueSubmit    = (PFN_vkQueueSubmit)ip_GDPA(dev,"vkQueueSubmit");
   g_pacerVk=vk;
-  Log("PresentPacing on: wait for the frame's GPU work before PresentStart while DLSS-G is on (fns %s)",
+  Log("PresentPacing configured=%d; wait functions=%s",(int)Rt().presentPacing,
       vk.createFence&&vk.resetFences&&vk.getFenceStatus&&vk.waitForFences&&vk.queueSubmit ? "ok" : "MISSING");
 }
 static void PacePresent(VkQueue q){
@@ -332,34 +385,71 @@ static void PacePresent(VkQueue q){
     n=timeouts=skipped=unavailable=0; sumMs=maxMs=0; }
 }
 
+static void ApplyFPSCap(){
+  uint32_t cap=Rt().fpsCap.load(std::memory_order_relaxed);
+  static uint32_t appliedCap=0;static long long nextDeadline=0;
+  if(cap!=appliedCap){appliedCap=cap;nextDeadline=0;}
+  if(!cap)return;
+  long long interval=1000000LL/(long long)cap;
+  long long now=NowUs();
+  if(!nextDeadline || now<nextDeadline-interval*4 || now>nextDeadline+interval*4)nextDeadline=now;
+  nextDeadline+=interval;
+  long long wait=nextDeadline-now;
+  if(wait>1500)Sleep((DWORD)((wait-1000)/1000));
+  while(NowUs()<nextDeadline)SwitchToThread();
+}
 static VKAPI_ATTR VkResult VKAPI_CALL w_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi){
+  if(RouteForPresent(pi)==PresentRoute::Native){
+    static std::atomic<int> routed{0};
+    if(routed.fetch_add(1)<5)Log("present routed native: swapchain %p was not created for the owned device",(pi && pi->swapchainCount && pi->pSwapchains)?(void*)pi->pSwapchains[0]:nullptr);
+    Reentry guard;
+    if(o_QueuePresentKHR_export) return o_QueuePresentKHR_export(q, pi);
+    return t_QueuePresentKHR ? t_QueuePresentKHR(q, pi) : VK_ERROR_INITIALIZATION_FAILED;
+  }
+  ApplyFPSCap();
+  static std::atomic<uint32_t> diagnosticPresent{0};
+  const uint32_t serial=diagnosticPresent.fetch_add(1,std::memory_order_relaxed)+1;
+  const bool trace=DebugLoggingEnabled() && (serial<=256 || serial%120==0);
+  if(trace){Log("present[%u] enter: queue=%p waits=%u swapchains=%u",serial,(void*)q,pi?pi->waitSemaphoreCount:0,pi?pi->swapchainCount:0);if(pi){auto node=(const VkBaseInStructure*)pi->pNext;for(unsigned i=0;node && i<16;++i,node=node->pNext)Log("present[%u] pNext[%u] type=%d",serial,i,(int)node->sType);}}
+  SwapchainScope lifecycle;
+  if(trace)Log("present[%u] lifecycle lock acquired",serial);
+  if(trace && pi){for(uint32_t i=0;i<pi->waitSemaphoreCount;++i)Log("present[%u] waitSemaphore[%u]=%p",serial,i,(void*)pi->pWaitSemaphores[i]);for(uint32_t i=0;i<pi->swapchainCount;++i)Log("present[%u] swapchain[%u]=%p imageIndex=%u",serial,i,(void*)pi->pSwapchains[i],pi->pImageIndices[i]);}
   StartMenu();
   StartWatchdog();
   g_wdPresents.fetch_add(1);
   if(!g_presentTid.load()) g_presentTid.store((uint32_t)GetCurrentThreadId());
   PosScope _p(1);
   NgxProbeTick();                  // cheap after hooked (one bool)
-  if(Cfg().provider==FGProvider::FSR3){PollHotkeys();bool seen=ConsumeEvalSeen();Reentry guard;VkPresentInfoKHR overlay{};auto selected=MenuRender(q,pi,overlay)?&overlay:pi;auto result=FsrPresent(q,selected,seen && !MenuIsOpen());if(result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR)RecordGamePresent();return result;}
+  if(Cfg().provider==FGProvider::FSR3){PollHotkeys();bool seen=ConsumeEvalSeen();Reentry guard;VkPresentInfoKHR overlay{};auto selected=MenuRender(q,pi,overlay)?&overlay:pi;if(trace)Log("present[%u] FSR present begin inputs=%d",serial,(int)seen);auto result=FsrPresent(q,selected,seen && !MenuIsOpen());if(trace)Log("present[%u] FSR present end result=%d",serial,(int)result);MenuPresentCompleted(seen,result);if(result==VK_SUCCESS||result==VK_SUBOPTIMAL_KHR)RecordGamePresent();return result;}
   ConsumeEvalSeen();
   // Read readiness from the exact token selected for this present, not from
   // an unrelated evaluation that may have run ahead on another thread.
   const bool inputsReady=PresentMarkersBegin();
+  if(trace)Log("present[%u] markers ready=%d; generation=%d",serial,(int)inputsReady,(int)g_genOn.load());
   if(!inputsReady && g_genOn.exchange(false)){SetDLSSGeneration(false);g_evalStreak=0;}
   EvalGate(inputsReady);
   double timing0=NowUs();
   if(Rt().presentPacing && g_genOn.load()) PacePresent(q);   // frame's GPU work done before PresentStart
   double timing1=NowUs();
+  if(trace)Log("present[%u] DLSS-G state query begin",serial);
   PollDLSSGState();                // slDLSSGGetState on the present thread: status + generated-frame stats
+  if(trace)Log("present[%u] DLSS-G state query end",serial);
   static bool logged=false; if(!logged){ logged=true;
     Log("w_QueuePresentKHR live queue=%p tid=%lu waitSems=%u swapchains=%u pNext=%s (eval-driven gate)", (void*)q,
         (unsigned long)GetCurrentThreadId(), pi?pi->waitSemaphoreCount:0u, pi?pi->swapchainCount:0u, (pi&&pi->pNext)?"yes":"no"); }
   static int oddLogged=0; if(pi && pi->waitSemaphoreCount!=1 && oddLogged<5){ oddLogged++; Log("present with waitSemaphoreCount=%u", pi->waitSemaphoreCount); }
   VkResult r;
   double timing2=NowUs();
-  { PosScope _q(2); Reentry _; VkPresentInfoKHR overlay{};auto selected=MenuRender(q,pi,overlay)?&overlay:pi;r = t_QueuePresentKHR(q, selected); }   // interposer present = DLSS-G generation
+  { PosScope _q(2); Reentry _; VkPresentInfoKHR overlay{},compatible{};if(trace)Log("present[%u] overlay begin",serial);bool drew=MenuRender(q,pi,overlay);const auto* selected=drew?&overlay:pi;
+    if(NormalizeLocalPresent(selected,compatible)){selected=&compatible;static bool noted=false;if(!noted){noted=true;Log("Vulkan present compatibility: redundant LOCAL device-group mask 1 removed; remaining extensions preserved");}}
+    if(trace)Log("present[%u] overlay end drew=%d; Streamline present begin",serial,(int)drew);
+    if(serial==1)Log("Diagnostic first-presentation checkpoint before Streamline call");
+    r = t_QueuePresentKHR(q, selected);if(trace)Log("present[%u] Streamline present end result=%d",serial,(int)r); }   // interposer present = DLSS-G generation
   double timing3=NowUs();
+  MenuPresentCompleted(inputsReady,r);
   static int badLogged=0; if(r!=VK_SUCCESS && badLogged<10){ badLogged++; Log("present -> %d", (int)r); }
   { PosScope _m(3); PresentMarkersEnd(); }   // PresentEnd, then next frame: new token + Reflex sleep + SimulationStart
+  if(trace)Log("present[%u] completed",serial);
   if(r==VK_SUCCESS||r==VK_SUBOPTIMAL_KHR)RecordGamePresent();
   if(r==VK_SUCCESS||r==VK_SUBOPTIMAL_KHR)PerformanceProbeFrame((timing1-timing0)/1000.0,(timing3-timing2)/1000.0,(timing2-timing1+NowUs()-timing3)/1000.0);
   return r;
@@ -372,6 +462,7 @@ static PFN_vkGetSwapchainImagesKHR t_GetSwapchainImagesKHR{};
 static VKAPI_ATTR VkResult VKAPI_CALL w_GetSwapchainImagesKHR(VkDevice d,VkSwapchainKHR sc,uint32_t* count,VkImage* images){
   uint32_t capacity=images&&count?*count:0;
   VkResult result;{Reentry guard;result=t_GetSwapchainImagesKHR(d,sc,count,images);}
+  if(images && count && (result==VK_SUCCESS || result==VK_INCOMPLETE))MenuCaptureImages(d,sc,*count,images);
   static int logged=0;if(logged++<6)Log("Game swapchain images: capacity=%u returned=%u result=%d images=%s",capacity,count?*count:0,(int)result,images?"yes":"no");
   return result;
 }
@@ -417,7 +508,9 @@ static VKAPI_ATTR void VKAPI_CALL w_SetHdrMetadataEXT(VkDevice d, uint32_t n, co
 // Swap in a wrapper for the names above; everything else passes straight through.
 static PFN_vkDestroySwapchainKHR t_DestroySwapchainKHR{};
 static VKAPI_ATTR void VKAPI_CALL w_DestroySwapchainKHR(VkDevice d,VkSwapchainKHR sc,const VkAllocationCallbacks* a){
+  SwapchainScope lifecycle;
   if(Cfg().provider==FGProvider::DLSSG)GateOffForSwapchain();
+  UntrackOwnedSwapchain(sc);
   Reentry guard;MenuDestroySwapchain(d,sc);t_DestroySwapchainKHR(d,sc,a);
 }
 static PFN_vkVoidFunction WrapDeviceFn(const char* name, PFN_vkVoidFunction ip){
@@ -447,6 +540,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL w_GetDeviceProcAddr(VkDevice dev
   return GameViewGDPA(dev, name);
 }
 static PFN_vkVoidFunction GameViewGDPA(VkDevice dev, const char* name){
+  if(dev && dev!=g_ownedDevice.load())return o_GDPA_real?o_GDPA_real(dev,name):nullptr;
   // Before the interposer exists (early third-party resolution) there is nothing to wrap yet.
   if (!ip_GDPA){auto native=o_GDPA_real?o_GDPA_real(dev,name):nullptr;if(!native)return nullptr;
     if(!strcmp(name,"vkCreateSwapchainKHR")){t_CreateSwapchainKHR=(PFN_vkCreateSwapchainKHR)native;return (PFN_vkVoidFunction)w_CreateSwapchainKHR;}
@@ -455,7 +549,7 @@ static PFN_vkVoidFunction GameViewGDPA(VkDevice dev, const char* name){
   }
   if (!strcmp(name, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)w_GetDeviceProcAddr;   // keep later lookups in our view
   PFN_vkVoidFunction ip; { Reentry _; ip = ip_GDPA(dev, name); }
-  if (!ip) return nullptr;
+  if (!ip){LogDebug("Vulkan device entry unavailable: %s device=%p",name,(void*)dev);return nullptr;}
   if (!strcmp(name, "vkQueuePresentKHR"))   { t_QueuePresentKHR   = (PFN_vkQueuePresentKHR)ip;   return (PFN_vkVoidFunction)w_QueuePresentKHR; }   // wrap: PollDLSSGState MUST be on the present thread
   if (!strcmp(name, "vkCreateSwapchainKHR")){ t_CreateSwapchainKHR= (PFN_vkCreateSwapchainKHR)ip; return (PFN_vkVoidFunction)w_CreateSwapchainKHR; }
   return WrapDeviceFn(name, ip);   // stall-attribution wrappers, else the interposer's own device function
@@ -475,6 +569,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL h_GetInstanceProcAddr(VkInstance
   // vkCreateInstance: return our wrapper WITHOUT initializing SL here (this runs under the
   // loader lock). slInit + interposer resolution happen inside w_CreateInstance (the CALL).
   if(!strcmp(name,"vkCreateInstance")) return (PFN_vkVoidFunction)w_CreateInstance;
+  if(inst && inst!=g_ownedInstance.load())return o_GIPA?o_GIPA(inst,name):nullptr;
   if(!strcmp(name,"vkEnumerateDeviceExtensionProperties"))return (PFN_vkVoidFunction)GameExtensions;
 
   // Everything else: interposer if ready, else the real loader. Before slInit (ip_GIPA null),
@@ -523,10 +618,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL h_GetDeviceProcAddrExport(VkDevi
 static PFN_vkGetSwapchainImagesKHR o_GetSwapchainImagesKHR_export{};
 static PFN_vkAcquireNextImageKHR   o_AcquireNextImageKHR_export{};
 static PFN_vkAcquireNextImage2KHR  o_AcquireNextImage2KHR_export{};
-static PFN_vkQueuePresentKHR       o_QueuePresentKHR_export{};
 static PFN_vkCreateSwapchainKHR    o_CreateSwapchainKHR_export{};
 // Resolve the game-view function once per name via our own GDPA wrapper (interposer + wrappers).
 template <typename F> static F GameView(const char* name, F& cache, VkDevice dev){
+  if(dev!=g_ownedDevice.load())return nullptr;
   if(!cache && gDevice){ cache = (F)w_GetDeviceProcAddr(dev, name); }
   return cache;
 }

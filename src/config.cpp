@@ -19,6 +19,11 @@ void SaveNextProvider(FGProvider provider){
   WritePrivateProfileStringA("fgvk","UserFGOff","0",path);
 }
 bool LoadFPSCounter(){char path[MAX_PATH]{};IniPath(path,sizeof(path));return GetPrivateProfileIntA("fgvk","ShowFPS",0,path)!=0;}
+uint32_t LoadFPSCap(){char path[MAX_PATH]{};IniPath(path,sizeof(path));int v=GetPrivateProfileIntA("fgvk","FPSCap",0,path);return v<0?0u:v>480?480u:(uint32_t)v;}
+void SaveFPSCap(uint32_t cap){char path[MAX_PATH]{};IniPath(path,sizeof(path));char value[16]{};snprintf(value,sizeof(value),"%u",cap);WritePrivateProfileStringA("fgvk","FPSCap",value,path);g_rt.fpsCap=cap;}
+void SaveMenuKey(int vk){char path[MAX_PATH]{};IniPath(path,sizeof(path));char value[16]{};snprintf(value,sizeof(value),"0x%X",vk);WritePrivateProfileStringA("fgvk","MenuKey",value,path);g_rt.menuKey=vk;}
+float LoadMenuScale(){char path[MAX_PATH]{};IniPath(path,sizeof(path));char value[16]{};GetPrivateProfileStringA("fgvk","MenuScale","1",value,sizeof(value),path);float v=(float)atof(value);return v<0.8f?0.8f:v>1.5f?1.5f:v;}
+void SaveMenuScale(float scale){char path[MAX_PATH]{};IniPath(path,sizeof(path));char value[16]{};snprintf(value,sizeof(value),"%.2f",scale);WritePrivateProfileStringA("fgvk","MenuScale",value,path);}
 void SaveFPSCounter(bool enabled){char path[MAX_PATH]{};IniPath(path,sizeof(path));WritePrivateProfileStringA("fgvk","ShowFPS",enabled?"1":"0",path);}
 bool PerformanceProbeRequested(){return probeRequested;}
 void EndPerformanceProbe(){probeRequested=false;char path[MAX_PATH]{};IniPath(path,sizeof(path));WritePrivateProfileStringA("fgvk","BenchmarkFG","0",path);}
@@ -74,6 +79,8 @@ static void WriteDefaults(const char* path){
     "; While frame generation is on, wait (max 100 ms) for the frame's GPU work before marking PresentStart.\n"
     "; Smooths bursty multi-frame-generation pacing at a small fps cost. 0 = off\n"
     "PresentPacing=0\n"
+    "; Frame rate limit on the present thread in frames per second (0 = unlimited). Can also be set in the menu.\n"
+    "FPSCap=0\n"
     "; Motion-vector scale handed to Streamline: 1 = the game's DLSS scale divided by the motion-vector buffer size\n"
     "; (Streamline multiplies it back by that size before DLSS-G sees it). 0 = raw values, 1500x too large; A/B only.\n"
     "MvecScaleNormalized=1\n"
@@ -100,6 +107,7 @@ void LoadConfig(){
   else if(_stricmp(provider,"OFF")==0)c.provider=FGProvider::Off;
   else if(_stricmp(provider,"DLSSG")!=0){c.provider=FGProvider::Off;Log("Unknown FGProvider=%s; FG disabled",provider);}
   c.enabled = GetPrivateProfileIntA("fgvk","Enabled",0,path)!=0;
+  c.debugLogging = GetPrivateProfileIntA("fgvk","DebugLogging",0,path)!=0;
   if(c.provider==FGProvider::Off)c.enabled=false;
   char appid[32]{};
   GetPrivateProfileStringA("fgvk","ApplicationId","0",appid,sizeof(appid),path);
@@ -113,6 +121,7 @@ void LoadConfig(){
   c.tagHudless  = GetPrivateProfileIntA("fgvk","TagHUDLess",c.tagHudless?1:0,path)!=0;
   c.tagUI       = GetPrivateProfileIntA("fgvk","TagUI",c.tagUI?1:0,path)!=0;
   c.presentPacing = GetPrivateProfileIntA("fgvk","PresentPacing",c.presentPacing?1:0,path)!=0;
+  c.fpsCap = (uint32_t)GetPrivateProfileIntA("fgvk","FPSCap",0,path); if(c.fpsCap>480) c.fpsCap=480;
   c.mvecScaleNormalized = GetPrivateProfileIntA("fgvk","MvecScaleNormalized",c.mvecScaleNormalized?1:0,path)!=0;
   c.onAfterEvalFrames  = (uint32_t)GetPrivateProfileIntA("fgvk","OnAfterEvalFrames",(int)c.onAfterEvalFrames,path);
   c.offAfterIdleFrames = (uint32_t)GetPrivateProfileIntA("fgvk","OffAfterIdleFrames",(int)c.offAfterIdleFrames,path);
@@ -121,13 +130,14 @@ void LoadConfig(){
   char kb[32];
   auto key=[&](const char* k, int def){ GetPrivateProfileStringA("fgvk",k,"",kb,sizeof(kb),path); if(!kb[0]) return def; return (int)strtol(kb,nullptr,0); };
   c.keyToggleFG = key("KeyToggleFG", c.keyToggleFG);
+  c.menuKey = key("MenuKey", c.menuKey); if(c.menuKey<=0) c.menuKey=0x2D;
   c.keyCycleFrames = key("KeyCycleFrames", c.keyCycleFrames);
   g_cfg=c;
-  g_rt.presentPacing=c.presentPacing;
+  g_rt.presentPacing=c.presentPacing; g_rt.fpsCap=c.fpsCap; g_rt.menuKey=c.menuKey;
   g_rt.frames = c.dlssgFrames; g_rt.fgUserOff = GetPrivateProfileIntA("fgvk","UserFGOff",0,path)!=0;
   UpdateMenuRuntime(g_rt.fgUserOff,g_rt.frames);
-  Log("config %s: DLSSGFrames=%u (x%u) ReflexMode=%d ReflexSleep=%d TagHUDLess=%d TagUI=%d PresentPacing=%d MvecScaleNormalized=%d OnAfterEvalFrames=%u OffAfterIdleFrames=%u keys: toggleFG=0x%x cycle=0x%x",
-      path, c.dlssgFrames, c.dlssgFrames+1, c.reflexMode, (int)c.reflexSleep, (int)c.tagHudless, (int)c.tagUI, (int)c.presentPacing, (int)c.mvecScaleNormalized, c.onAfterEvalFrames, c.offAfterIdleFrames,
+  Log("config %s: DLSSGFrames=%u (x%u) ReflexMode=%d ReflexSleep=%d TagHUDLess=%d TagUI=%d PresentPacing=%d FPSCap=%u MvecScaleNormalized=%d OnAfterEvalFrames=%u OffAfterIdleFrames=%u keys: toggleFG=0x%x cycle=0x%x",
+      path, c.dlssgFrames, c.dlssgFrames+1, c.reflexMode, (int)c.reflexSleep, (int)c.tagHudless, (int)c.tagUI, (int)c.presentPacing, c.fpsCap, (int)c.mvecScaleNormalized, c.onAfterEvalFrames, c.offAfterIdleFrames,
       c.keyToggleFG, c.keyCycleFrames);
 }
 }

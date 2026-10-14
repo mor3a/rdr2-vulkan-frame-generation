@@ -6,6 +6,7 @@ enum class FGProvider { Off, DLSSG, FSR3 };
 // fgvk.ini next to fgvk.dll (written with defaults on first run). Read once at DLL attach.
 struct Config {
   bool enabled = false; // explicit opt-in: experimental RDR2 port
+  bool debugLogging = false;
   FGProvider provider=FGProvider::DLSSG;
   uint32_t applicationId = 0; // do not inherit another game's NGX identity
 
@@ -15,6 +16,7 @@ struct Config {
   bool     tagHudless  = false;  // SR output precedes the final backbuffer's color processing
   bool     tagUI       = false;  // tag a transparent UI color+alpha layer
   bool     presentPacing = false; // optional extra GPU wait; off avoids duplicate serialization
+  uint32_t fpsCap = 0;           // present-thread frame rate limit, 0 = unlimited
   bool     mvecScaleNormalized = true;  // send Streamline mvScale / mvec extent (it multiplies back by the extent); 0 = raw NGX values
   uint32_t onAfterEvalFrames  = 60;   // DLSS-SR frames before DLSS-G turns on
   uint32_t offAfterIdleFrames = 3;   // presents without DLSS-SR before DLSS-G suspends
@@ -22,6 +24,7 @@ struct Config {
   // Hotkeys (Windows virtual-key codes, 0 = disabled). Defaults follow PureDark's INI: numpad * toggles
   // FG, End cycles x2/x3/x4.
   int keyToggleFG   = 0x6A;   // VK_MULTIPLY
+  int menuKey = 0x2D;         // VK_INSERT, menu open/close key
   int keyCycleFrames= 0x23;   // VK_END
 };
 const Config& Cfg();
@@ -30,6 +33,8 @@ void LoadConfig();
 struct Runtime {
   std::atomic<bool> fgUserOff{false};   // shared with the DLSS input recording thread
   uint32_t frames = 1;          // current generated-frames setting
+  std::atomic<uint32_t> fpsCap{0};
+  std::atomic<int> menuKey{0x2D};
   bool presentPacing = false;
 };
 Runtime& Rt();
@@ -37,6 +42,11 @@ Runtime& Rt();
 bool PollHotkeys();
 void SaveNextProvider(FGProvider provider);
 bool LoadFPSCounter();
+uint32_t LoadFPSCap();
+void SaveMenuKey(int vk);
+float LoadMenuScale();
+void SaveMenuScale(float scale);
+void SaveFPSCap(uint32_t cap);
 void SaveFPSCounter(bool enabled);
 bool PerformanceProbeRequested();
 void EndPerformanceProbe();

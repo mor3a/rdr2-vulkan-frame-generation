@@ -1,0 +1,7 @@
+Fixed startup crashes caused by legacy latency DLLs and conflicting Vulkan initialization.
+Improved compatibility with overlays and systems creating additional Vulkan devices.
+Added an adjustable FPS limit and a customizable menu hotkey.
+Improved FPS counter stability during brief measurement interruptions.
+Redesigned the menu with clearer text and automatic sizing to fit update notifications and settings.
+Re-enabled Nexus update notifications with a direct link to the mod page.
+Detailed diagnostics are available through DebugLogging in the INI.

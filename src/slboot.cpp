@@ -7,6 +7,7 @@
 #include "vkhooks.h"
 #include "config.h"
 #include "performance_probe.h"
+#include "latency_imports.h"
 
 #include <sl.h>
 #include <sl_helpers_vk.h>
@@ -16,6 +17,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <mutex>
 #include <detours.h>
 #include <intrin.h>
 #include <sl_core_api.h>
@@ -63,6 +65,24 @@ static bool LocalPluginLoaded(const wchar_t* name){
   wchar_t expected[MAX_PATH]{};swprintf(expected,MAX_PATH,L"%s\\%s",s_slDir,name);
   return _wcsicmp(path,expected)==0;
 }
+static bool BindBundledLatency(){
+  wchar_t path[MAX_PATH]{};swprintf(path,MAX_PATH,L"%s\\NvLowLatencyVk.dll",s_slDir);
+  HMODULE latency=LoadLibraryExW(path,nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  wchar_t loaded[MAX_PATH]{};if(latency)GetModuleFileNameW(latency,loaded,MAX_PATH);
+  if(!latency || _wcsicmp(path,loaded) || !GetProcAddress(latency,"NvLL_VK_NotifyOutOfBandQueue")){
+    Log("Bundled latency binding refused: expected=%S loaded=%S error=%lu",path,loaded,GetLastError());return false;
+  }
+  unsigned total=0;
+  for(auto name:{L"sl.common.dll",L"sl.reflex.dll",L"sl.dlss_g.dll",L"sl.pcl.dll"}){
+    LatencyBinding binding{};
+    if(!BindLatencyImports(GetModuleHandleW(name),latency,binding)){
+      Log("Bundled latency binding failed: plugin=%S reason=%s",name,binding.error?binding.error:"unknown");return false;
+    }
+    total+=binding.imports;Log("Bundled latency binding: plugin=%S imports=%u",name,binding.imports);
+  }
+  if(!total){Log("Bundled latency binding refused: no matching delay imports");return false;}
+  Log("Streamline latency imports pinned to %S; imports=%u",loaded,total);return true;
+}
 static SlFns g_slFns;
 SlFns& GetSlFns(){ return g_slFns; }
 
@@ -103,7 +123,9 @@ static HMODULE LoadInterposer(){
 
 // Resolves slInit/slSetVulkanInfo/slGetFeatureFunction from the interposer module
 // and calls slInit once. Returns true if slInit succeeded.
+static std::mutex g_slInitMutex;
 static bool EnsureSlInit(){
+  std::lock_guard<std::mutex> lock(g_slInitMutex);
   static bool s_tried = false;
   static bool s_armed = false;
   if(s_tried) return s_armed;
@@ -142,11 +164,12 @@ static bool EnsureSlInit(){
   p.applicationId = Cfg().applicationId;
   // Streamline's own verbose log - written next to the game exe; names the exact
   // internal step DLSS-G is on when something wedges.
-  p.logLevel = sl::LogLevel::eDefault;
+  p.logLevel = sl::LogLevel::eVerbose;
+  p.logMessageCallback=[](sl::LogType type,const char* message){Log("[Streamline type=%u] %s",(unsigned)type,message?message:"<empty>");};
   // sl.log next to RDR2.exe (wherever the game is installed)
   static wchar_t s_logDir[MAX_PATH]{};
   { GetModuleFileNameW(nullptr, s_logDir, MAX_PATH); wchar_t* s=wcsrchr(s_logDir,L'\\'); if(s) *s=0; }
-  p.pathToLogsAndData = s_logDir;
+  p.pathToLogsAndData = nullptr; // Unified private diagnostic log via callback.
   // Plugin search: Streamline stops at the FIRST directory that holds plugins, so our folder
   // wins and stray sl.*.dll copies next to RDR2.exe are never loaded. NGX, however, receives
   // EVERY path in this list as a feature-DLL search path, and the game's own DLSS Super
@@ -169,6 +192,10 @@ static bool EnsureSlInit(){
         s_armed=false;break;
       }
     }
+    if(s_armed && !BindBundledLatency()){
+      auto shutdown=(PFun_slShutdown*)GetProcAddress(g_sl,"slShutdown");if(shutdown)shutdown();s_armed=false;
+      Log("Latency dependency unavailable; native Vulkan fallback");
+    }
     if(s_armed)Log("Matched local Streamline plugins verified before Vulkan device creation");
   }
   return s_armed;
@@ -178,7 +205,11 @@ static bool EnsureSlInit(){
 // Must be called AFTER slSetVulkanInfo (the header requires the device to be
 // set first: "Macros which use slGetFeatureFunction can only be used AFTER
 // device is set by calling either slSetD3DDevice or slSetVulkanInfo").
+// First feature lookup starts Streamline plugin initialization, which is not
+// safe to enter concurrently from two device-creation threads.
+static std::mutex g_featureMutex;
 static bool EnsureFeatureFunctions(){
+  std::lock_guard<std::mutex> lock(g_featureMutex);
   static bool s_tried = false;
   static bool s_ok = false;
   if(s_tried) return s_ok;
@@ -190,6 +221,10 @@ static bool EnsureFeatureFunctions(){
   sl::Result r;
 
   fn = nullptr;
+  // Automatic debugger attachment made the local game exit cleanly during
+  // startup. Keep the non-invasive collector; debugger mode is an explicit
+  // diagnostic fixture option (RDR2FG_EXTERNAL_DEBUGGER), not a runtime default.
+  Log("BOOT STEP begin: slGetFeatureFunction(Reflex, slReflexSetOptions)");
   r = p_slGetFeatureFunction(sl::kFeatureReflex, "slReflexSetOptions", fn);
   Log("slGetFeatureFunction(slReflexSetOptions) -> %d fn=%p", (int)r, fn);
   p_slReflexSetOptions = (PFun_slReflexSetOptions*)fn;
@@ -233,6 +268,11 @@ void OnDeviceCreated(){
   // device and caused every crash/queue-rejection before. We only enable the features.
   if(!EnsureSlInit()) { Log("OnDeviceCreated: slInit not ready"); return; }
   if(!EnsureFeatureFunctions()) { Log("OnDeviceCreated: feature function resolution failed"); return; }
+
+  // Establish the viewport's mode before swapchain creation and the first
+  // present. The host gate being false does not initialize plugin options.
+  SetDLSSGeneration(false);
+  LogModules();
 
   // DLSS-G requires Reflex ON. Set Reflex now; DLSS-G is enabled later by the eval-driven gate.
   sl::ReflexOptions ro{};

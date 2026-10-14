@@ -17,4 +17,6 @@ void MenuBuildUI();
 void MenuRegisterSwapchain(VkDevice,VkPhysicalDevice,VkInstance,uint32_t,VkSwapchainKHR,const VkSwapchainCreateInfoKHR*,PFN_vkGetDeviceProcAddr,PFN_vkGetSwapchainImagesKHR);
 void MenuDestroySwapchain(VkDevice,VkSwapchainKHR);
 bool MenuRender(VkQueue,const VkPresentInfoKHR*,VkPresentInfoKHR&);
+void MenuPresentCompleted(bool evaluated,VkResult result);
+void MenuCaptureImages(VkDevice,VkSwapchainKHR,uint32_t,const VkImage*);
 }
