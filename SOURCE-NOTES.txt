@@ -1,8 +1,11 @@
-PUBLIC SOURCE - 0.30
+PUBLIC SOURCE - 0.82
 
-Public frame generation integration source based on the 0.30 branch.
-The Nexus runtime update checker is excluded and replaced with a no-network stub.
-Public builds do not reproduce the complete Nexus runtime binary byte for byte.
-The 0.31beta compatibility experiment and 0.40beta camera experiment are not included.
-Main downloads: https://www.nexusmods.com/reddeadredemption2/mods/10997
-Third-party licenses and acknowledgements are preserved.
+src/, tests/ and vendor/ reflect the 0.82 application source.
+The Nexus runtime update checker replaces the historical public no-network stub.
+The repository wrapper prepares pinned dependencies under .deps.
+The Native queue correction is included as a source patch and MSVC interposer build helper.
+Updating the ASI alone does not replace a stock interposer with the corrected binary.
+Runtime binaries, logs and private development notes are not committed.
+The main build does not rebuild proprietary runtimes or the optional unlock core.
+Third-party copyrights and licenses remain in effect.
+See docs/BUILD.md and docs/MAINTAINER-NOTES.md.

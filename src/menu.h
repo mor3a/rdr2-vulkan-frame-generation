@@ -3,6 +3,7 @@
 #include <vulkan/vulkan.h>
 namespace fgvk {
 void StartMenu();
+void MenuBindWindow(void* window);
 bool ConsumeMenuRequest(bool& off,uint32_t& frames);
 void UpdateMenuRuntime(bool off,uint32_t frames);
 void UpdateMenuStats(uint32_t maximum,uint32_t status,float ratio);
@@ -13,6 +14,7 @@ bool MenuIsOpen();
 void MenuRendererAvailable(bool available);
 bool MenuInitializeUI();
 bool MenuHasDrawing();
+void MenuResetUI();
 void MenuBuildUI();
 void MenuRegisterSwapchain(VkDevice,VkPhysicalDevice,VkInstance,uint32_t,VkSwapchainKHR,const VkSwapchainCreateInfoKHR*,PFN_vkGetDeviceProcAddr,PFN_vkGetSwapchainImagesKHR);
 void MenuDestroySwapchain(VkDevice,VkSwapchainKHR);

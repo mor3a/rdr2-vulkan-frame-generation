@@ -1,4 +1,5 @@
 #include "log.h"
+#include "update_check.h"
 #include <windows.h>
 #include <cstdio>
 #include <cstdarg>
@@ -117,7 +118,7 @@ void LogInit() {
   snprintf(g_path, sizeof(g_path), "%sRDR2VulkanFG.log", exe);
   char previous[MAX_PATH]{};snprintf(previous,sizeof(previous),"%sRDR2VulkanFG.previous.log",exe);
   MoveFileExA(g_path,previous,MOVEFILE_REPLACE_EXISTING);
-  FILE* f=nullptr; if (fopen_s(&f,g_path,"w")==0 && f){ fprintf(f,"fgvk log start; pid=%lu; architecture=x64; diagnostic schema=5; 0.30; automatic unified diagnostics\n",GetCurrentProcessId()); fclose(f);}
+  FILE* f=nullptr; if (fopen_s(&f,g_path,"w")==0 && f){ fprintf(f,"fgvk log start; pid=%lu; architecture=x64; diagnostic schema=5; %s\n",GetCurrentProcessId(),kModVersion); fclose(f);}
 }
 bool DebugLoggingEnabled(){return debugEnabled.load(std::memory_order_relaxed);}
 void SetDebugLogging(bool enabled){

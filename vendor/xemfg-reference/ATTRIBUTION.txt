@@ -1,0 +1,26 @@
+MFG-Unlocker reference code attribution
+
+Upstream: https://github.com/dashdogy/MFG-Unlocker
+Pinned commit: 2b52823e3769c31cf52d3b368c6963cff8fc5344
+License: MIT; Copyright (c) 2026 Michael Robles.
+The accompanying MFG-Unlocker-LICENSE.txt contains the full license.
+
+RDR2 Vulkan Frame Generation adapts the XeSS host-unlock reference for
+experimental 3x/4x operation while retaining the native 2x model.
+This attribution does not imply upstream endorsement or verified gameplay.
+Local adaptations: C++17 containers; rollback verification distinguishes
+an untouched unsupported layout from an unverified write transaction.
+
+SDK output pacing adaptation:
+The pinned MIT reference's sdk_pacing_dlssg.h BatchIntervalEstimator and
+NativeDeadline math and intermediate-output pacing calls are adapted for
+XeSS native output deadlines in
+src/xess_output_pacing.cpp. The estimator uses recent SDK batch-start
+intervals and the total output count for 2x/3x/4x cadence. The original
+SDK deadline function runs first; replacement requires a recognized SDK
+layout/call site and verified runtime context ownership, D3D12 identity,
+and non-Intel software mode. The SDK's existing wait/present path remains
+in use. Unsupported layouts/ownership retain the original SDK deadline.
+Local lifecycle adaptations reset cadence on transitions, unregister the
+owner before context destruction, and keep callback dependencies loaded.
+This is a compatibility adaptation; gameplay cadence is not yet confirmed.

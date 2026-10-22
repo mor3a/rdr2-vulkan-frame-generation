@@ -381,6 +381,7 @@ static ImGui_ImplVulkan_Data* ImGui_ImplVulkan_GetBackendData()
     return ImGui::GetCurrentContext() ? (ImGui_ImplVulkan_Data*)ImGui::GetIO().BackendRendererUserData : nullptr;
 }
 
+static void check_vk_result(VkResult err);
 static uint32_t ImGui_ImplVulkan_MemoryType(VkMemoryPropertyFlags properties, uint32_t type_bits)
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
@@ -390,7 +391,8 @@ static uint32_t ImGui_ImplVulkan_MemoryType(VkMemoryPropertyFlags properties, ui
     for (uint32_t i = 0; i < prop.memoryTypeCount; i++)
         if ((prop.memoryTypes[i].propertyFlags & properties) == properties && type_bits & (1 << i))
             return i;
-    return 0xFFFFFFFF; // Unable to find memoryType
+    check_vk_result(VK_ERROR_FEATURE_NOT_PRESENT);
+    return 0xFFFFFFFF; // Application callback aborts this operation before allocation.
 }
 
 static void check_vk_result(VkResult err)
@@ -416,8 +418,11 @@ static void CreateOrResizeBuffer(VkBuffer& buffer, VkDeviceMemory& buffer_memory
     VkResult err;
     if (buffer != VK_NULL_HANDLE)
         vkDestroyBuffer(v->Device, buffer, v->Allocator);
+    buffer = VK_NULL_HANDLE;
     if (buffer_memory != VK_NULL_HANDLE)
         vkFreeMemory(v->Device, buffer_memory, v->Allocator);
+    buffer_memory = VK_NULL_HANDLE;
+    buffer_size = 0;
 
     VkDeviceSize buffer_size_aligned = AlignBufferSize(IM_MAX(v->MinAllocationSize, new_size), bd->BufferMemoryAlignment);
     VkBufferCreateInfo buffer_info = {};
@@ -655,7 +660,8 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
         info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         info.flags = 0;
         info.queueFamilyIndex = v->QueueFamily;
-        vkCreateCommandPool(v->Device, &info, v->Allocator, &bd->TexCommandPool);
+        err = vkCreateCommandPool(v->Device, &info, v->Allocator, &bd->TexCommandPool);
+        check_vk_result(err);
     }
     if (bd->TexCommandBuffer == VK_NULL_HANDLE)
     {
@@ -732,8 +738,22 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
     backend_tex->DescriptorSet = ImGui_ImplVulkan_AddTexture(bd->TexSampler, backend_tex->ImageView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
     // Create the Upload Buffer:
-    VkDeviceMemory upload_buffer_memory;
-    VkBuffer upload_buffer;
+    struct UploadAllocation {
+        ImGui_ImplVulkan_InitInfo* info;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        bool pending = false;
+        ~UploadAllocation() {
+            // If a queue wait failed without device loss, retain potentially
+            // in-flight storage until device destruction instead of freeing it.
+            if (!pending) {
+                if (buffer) vkDestroyBuffer(info->Device, buffer, info->Allocator);
+                if (memory) vkFreeMemory(info->Device, memory, info->Allocator);
+            }
+        }
+    } upload{v};
+    auto& upload_buffer_memory = upload.memory;
+    auto& upload_buffer = upload.buffer;
     {
         VkBufferCreateInfo buffer_info = {};
         buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -819,13 +839,13 @@ bool ImGui_ImplVulkan_CreateFontsTexture()
     err = vkEndCommandBuffer(bd->TexCommandBuffer);
     check_vk_result(err);
     err = vkQueueSubmit(v->Queue, 1, &end_info, VK_NULL_HANDLE);
+    upload.pending = err == VK_SUCCESS;
     check_vk_result(err);
 
     err = vkQueueWaitIdle(v->Queue);
+    if (err == VK_SUCCESS || err == VK_ERROR_DEVICE_LOST) upload.pending = false;
     check_vk_result(err);
 
-    vkDestroyBuffer(v->Device, upload_buffer, v->Allocator);
-    vkFreeMemory(v->Device, upload_buffer_memory, v->Allocator);
 
     return true;
 }

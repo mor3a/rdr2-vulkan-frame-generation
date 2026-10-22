@@ -1,0 +1,3 @@
+Fixed a Native Vulkan startup issue caused by duplicate queue requests when the game uses all available queues in its dedicated compute family.
+
+Improved diagnostics for identifying frame-generation interruptions.

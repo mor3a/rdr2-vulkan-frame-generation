@@ -1,0 +1,215 @@
+--- a/source/core/sl.interposer/vulkan/wrapper.cpp
++++ b/source/core/sl.interposer/vulkan/wrapper.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include <unordered_set>
+ #include <algorithm>
++#include "source/core/sl.interposer/vulkan/queueAllocation.h"
+ 
+ #include "include/sl.h"
+ #include "source/core/sl.api/internal.h"
+@@ -888,78 +889,43 @@
+             }
+         }
+ 
+-        // Check and add extra graphics and compute queues for SL workloads
+-        s_vk.computeQueueIndex = 0;
+-        s_vk.graphicsQueueIndex = 0;
+-        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+-        const float defaultQueuePriority = 0.0f;
+-        std::vector<float> computeQueuePriorities( extraComputeQueues, defaultQueuePriority );
+-        std::vector<float> graphicsQueuePriorities(extraGraphicsQueues, defaultQueuePriority);
+-        std::vector<float> opticalFlowQueuePriorities(extraOpticalFlowQueues, defaultQueuePriority);
+-        for (uint32_t i = 0; i < createInfo.queueCreateInfoCount; i++)
+-        {
+-            queueCreateInfos.push_back(createInfo.pQueueCreateInfos[i]);
+-            if (auto search = graphicsComputeQueueFamilyIndex.find(queueCreateInfos.back().queueFamilyIndex); search != graphicsComputeQueueFamilyIndex.end())
+-            {
+-                s_vk.hostGraphicsComputeQueueInfo.emplace_back(QueueVkInfo{ search->second, search->first, {}, queueCreateInfos.back().flags, queueCreateInfos.back().queueCount });
+-            }
+-            if (extraComputeQueues != 0 && createInfo.pQueueCreateInfos[i].queueFamilyIndex == s_vk.computeQueueFamily)
+-            {
+-                if (queueFamilyProperties[s_vk.computeQueueFamily].queueCount < queueCreateInfos.back().queueCount + extraComputeQueues)
+-                {
+-                    SL_LOG_WARN("SL feature(s) requiring more compute queues than available on this device");
+-                    continue;
+-                }
+-                s_vk.computeQueueCreateFlags = queueCreateInfos.back().flags;
+-                s_vk.computeQueueIndex += queueCreateInfos.back().queueCount;
+-                computeQueuePriorities.insert(computeQueuePriorities.begin(), queueCreateInfos.back().pQueuePriorities, queueCreateInfos.back().pQueuePriorities + queueCreateInfos.back().queueCount);
+-                queueCreateInfos.back().pQueuePriorities = computeQueuePriorities.data();
+-                queueCreateInfos.back().queueCount += extraComputeQueues; // defaults to 0 unless requested otherwise by plugin(s)
+-                extraComputeQueues = 0;
+-            }
+-            if (extraGraphicsQueues != 0 && createInfo.pQueueCreateInfos[i].queueFamilyIndex == s_vk.graphicsQueueFamily)
+-            {
+-                if (queueFamilyProperties[s_vk.graphicsQueueFamily].queueCount < queueCreateInfos.back().queueCount + extraGraphicsQueues)
+-                {
+-                    SL_LOG_WARN("SL feature(s) requiring more graphics queues than available on this device");
+-                    continue;
+-                }
+-                s_vk.graphicsQueueCreateFlags = queueCreateInfos.back().flags;
+-                s_vk.graphicsQueueIndex += queueCreateInfos.back().queueCount;
+-                graphicsQueuePriorities.insert(graphicsQueuePriorities.begin(), queueCreateInfos.back().pQueuePriorities, queueCreateInfos.back().pQueuePriorities + queueCreateInfos.back().queueCount);
+-                queueCreateInfos.back().pQueuePriorities = graphicsQueuePriorities.data();
+-                queueCreateInfos.back().queueCount += extraGraphicsQueues; // defaults to 0 unless requested otherwise by plugin(s)
+-                extraGraphicsQueues = 0;
+-            }
+-        }
+-
+-        VkDeviceQueueCreateInfo queueInfo{};
+-
+-        if (extraComputeQueues > 0 && s_vk.computeQueueIndex == 0 && queueFamilyProperties[s_vk.computeQueueFamily].queueCount >= extraComputeQueues)
+-        {
+-            // We have to add compute queue(s) explicitly since host has none
+-            queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+-            queueInfo.queueFamilyIndex = s_vk.computeQueueFamily;
+-            queueInfo.flags = s_vk.computeQueueCreateFlags;
+-            queueInfo.queueCount = extraComputeQueues;
+-            queueInfo.pQueuePriorities = computeQueuePriorities.data();
+-            queueCreateInfos.push_back(queueInfo);
+-            extraComputeQueues = 0;
+-        }
+-
+-        if (s_vk.nativeOpticalFlowHWSupport && extraOpticalFlowQueues > 0 && queueFamilyProperties[s_vk.opticalFlowQueueFamily].queueCount >= extraOpticalFlowQueues)
+-        {
+-            queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+-            queueInfo.queueFamilyIndex = s_vk.opticalFlowQueueFamily;
+-            queueInfo.flags = s_vk.opticalFlowQueueCreateFlags;
+-            queueInfo.queueCount = extraOpticalFlowQueues;
+-            queueInfo.pQueuePriorities = opticalFlowQueuePriorities.data();
+-            queueCreateInfos.push_back(queueInfo);
+-            extraOpticalFlowQueues = 0;
+-        }
+-
+-        createInfo.pQueueCreateInfos = queueCreateInfos.data();
+-        createInfo.queueCreateInfoCount = (uint32_t)queueCreateInfos.size();
++        // Allocate against the complete original host request. An exhausted
++        // dedicated compute family must not be appended a second time.
++        QueueAllocationPlan queuePlan;
++        if (!queuePlan.Build(createInfo, queueFamilyProperties,
++                s_vk.graphicsQueueFamily, s_vk.computeQueueFamily,
++                s_vk.nativeOpticalFlowHWSupport ? s_vk.opticalFlowQueueFamily : UINT32_MAX,
++                extraGraphicsQueues, extraComputeQueues,
++                s_vk.nativeOpticalFlowHWSupport ? extraOpticalFlowQueues : 0))
++        {
++            SL_LOG_ERROR("SL queue allocation failed: no independent queue capacity available");
++            return VK_ERROR_INITIALIZATION_FAILED;
++        }
++        s_vk.graphicsQueueFamily = queuePlan.graphics.family;
++        s_vk.graphicsQueueIndex = queuePlan.graphics.index;
++        s_vk.graphicsQueueCreateFlags = queuePlan.graphics.flags;
++        s_vk.computeQueueFamily = queuePlan.compute.family;
++        s_vk.computeQueueIndex = queuePlan.compute.index;
++        s_vk.computeQueueCreateFlags = queuePlan.compute.flags;
++        if (s_vk.nativeOpticalFlowHWSupport)
++        {
++            s_vk.opticalFlowQueueFamily = queuePlan.optical.family;
++            s_vk.opticalFlowQueueIndex = queuePlan.optical.index;
++            s_vk.opticalFlowQueueCreateFlags = queuePlan.optical.flags;
++        }
++        s_vk.hostGraphicsComputeQueueInfo.clear();
++        for (uint32_t i = 0; i < createInfo.queueCreateInfoCount; ++i)
++        {
++            const auto& q = createInfo.pQueueCreateInfos[i];
++            if (auto entry = graphicsComputeQueueFamilyIndex.find(q.queueFamilyIndex); entry != graphicsComputeQueueFamilyIndex.end())
++                s_vk.hostGraphicsComputeQueueInfo.emplace_back(QueueVkInfo{entry->second, entry->first, {}, q.flags, q.queueCount});
++        }
++        SL_LOG_INFO("SL independent queues: graphics=%u/%u compute=%u/%u optical=%u/%u",
++            s_vk.graphicsQueueFamily, s_vk.graphicsQueueIndex,
++            s_vk.computeQueueFamily, s_vk.computeQueueIndex,
++            s_vk.opticalFlowQueueFamily, s_vk.opticalFlowQueueIndex);
++        createInfo.pQueueCreateInfos = queuePlan.infos.data();
++        createInfo.queueCreateInfoCount = (uint32_t)queuePlan.infos.size();
+ 
+         auto trampoline = (PFN_vkCreateDevice)GetProcAddress(lib, "vkCreateDevice");
+         auto res = trampoline(physicalDevice, &createInfo, pAllocator, pDevice);
+--- /dev/null
++++ b/source/core/sl.interposer/vulkan/queueAllocation.h
+@@ -0,0 +1,86 @@
++// RDR2VulkanFG: capacity-aware Streamline queue allocation.
++// Original application queue indices, flags, pNext chains and priorities stay intact.
++#pragma once
++#include <vector>
++#include <cstdint>
++#include <vulkan/vulkan_core.h>
++
++namespace sl::interposer {
++struct QueueAllocation {
++    uint32_t family = UINT32_MAX;
++    uint32_t index = 0;
++    VkDeviceQueueCreateFlags flags = 0;
++};
++struct QueueAllocationPlan {
++    std::vector<VkDeviceQueueCreateInfo> infos;
++    std::vector<std::vector<float>> priorities;
++    QueueAllocation graphics, compute, optical;
++
++    bool Build(const VkDeviceCreateInfo& host,
++               const std::vector<VkQueueFamilyProperties>& families,
++               uint32_t preferredGraphics, uint32_t preferredCompute,
++               uint32_t opticalFamily, uint32_t graphicsCount,
++               uint32_t computeCount, uint32_t opticalCount) {
++        infos.clear(); priorities.clear(); graphics={}; compute={}; optical={};
++        // Reserve before storing data pointers; no inner-vector is subsequently
++        // resized except the entry receiving this allocation.
++        infos.reserve(host.queueCreateInfoCount+3);
++        priorities.reserve(host.queueCreateInfoCount+3);
++        std::vector<uint32_t> used(families.size(),0);
++        for(uint32_t i=0;i<host.queueCreateInfoCount;++i) {
++            const auto& q=host.pQueueCreateInfos[i];
++            if(q.queueFamilyIndex>=families.size() || !q.queueCount || !q.pQueuePriorities ||
++               q.queueCount>families[q.queueFamilyIndex].queueCount-used[q.queueFamilyIndex])return false;
++            for(const auto& prior:infos)
++                if(prior.queueFamilyIndex==q.queueFamilyIndex && prior.flags==q.flags)return false;
++            used[q.queueFamilyIndex]+=q.queueCount;
++            infos.push_back(q);
++            priorities.emplace_back(q.pQueuePriorities,q.pQueuePriorities+q.queueCount);
++            infos.back().pQueuePriorities=priorities.back().data();
++        }
++        auto fits=[&](uint32_t family,uint32_t count,VkQueueFlags capability) {
++            return family<families.size() &&
++                (families[family].queueFlags&capability)==capability &&
++                count<=families[family].queueCount-used[family];
++        };
++        auto append=[&](QueueAllocation& out,uint32_t family,uint32_t count) {
++            out.family=family; out.flags=0;
++            for(size_t i=0;i<infos.size();++i) {
++                auto& q=infos[i];
++                if(q.queueFamilyIndex!=family || q.flags!=0)continue;
++                out.index=q.queueCount;
++                priorities[i].resize(q.queueCount+count,0.0f);
++                q.queueCount+=count; q.pQueuePriorities=priorities[i].data();
++                used[family]+=count; return;
++            }
++            VkDeviceQueueCreateInfo q{};
++            q.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
++            q.queueFamilyIndex=family; q.queueCount=count;
++            priorities.emplace_back(count,0.0f);
++            q.pQueuePriorities=priorities.back().data();
++            infos.push_back(q); used[family]+=count;
++        };
++        auto allocate=[&](QueueAllocation& out,uint32_t preferred,uint32_t count,VkQueueFlags capability) {
++            if(!count){out.family=preferred;return true;}
++            if(fits(preferred,count,capability)){append(out,preferred,count);return true;}
++            // Prefer an otherwise unused compute-only family before a graphics
++            // family. A graphics queue is compute-capable when advertised so.
++            if(capability==VK_QUEUE_COMPUTE_BIT)
++                for(uint32_t i=0;i<families.size();++i)
++                    if(i!=opticalFamily && !(families[i].queueFlags&VK_QUEUE_GRAPHICS_BIT) && fits(i,count,capability)) {
++                        append(out,i,count);return true;
++                    }
++            for(uint32_t i=0;i<families.size();++i)
++                if(i!=opticalFamily && fits(i,count,capability)){append(out,i,count);return true;}
++            return false;
++        };
++        if(!allocate(graphics,preferredGraphics,graphicsCount,VK_QUEUE_GRAPHICS_BIT) ||
++           !allocate(compute,preferredCompute,computeCount,VK_QUEUE_COMPUTE_BIT))return false;
++        if(opticalCount) {
++            if(!fits(opticalFamily,opticalCount,VK_QUEUE_OPTICAL_FLOW_BIT_NV))return false;
++            append(optical,opticalFamily,opticalCount);
++        } else optical.family=opticalFamily;
++        return true;
++    }
++};
++}

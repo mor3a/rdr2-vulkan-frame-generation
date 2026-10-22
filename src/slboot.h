@@ -4,6 +4,7 @@
 #include <sl_core_api.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
+#include "fg_state.h"
 
 namespace fgvk {
 struct SlFns {
@@ -15,8 +16,12 @@ struct SlFns {
 };
 SlFns& GetSlFns();
 bool EnsureStreamlineInit();
+void ApplyNativeFrameBudget();
+bool RestartNativeFGResources(unsigned preset);
+bool EnsureStreamlineD3D12Init();
 void* SlProxyFn(const char* name);
 void OnDeviceCreated();
-void SetDLSSGeneration(bool on);   // Task 4 fills; called from the vkCreateDevice hook (Task 2)
+bool SetDLSSGeneration(bool on);
+void RearmDLSSGeneration();
 void PollDLSSGState();    // Task 4 fills; called from the present hook
 }

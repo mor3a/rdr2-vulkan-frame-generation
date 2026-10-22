@@ -1,4 +1,13 @@
-Public 0.30 source build compiled successfully with the private Nexus update checker excluded.
-Focused checks passed: resource/input contracts, ABI forwarding, FPS sampling, swapchain lifecycle, menu startup, diagnostics, presentation compatibility/routing, latency imports and Vulkan ownership.
-Unhandled delay-load and fast-fail fixtures passed with the external DLL collector.
-This public build was not separately validated in gameplay and does not reproduce the Nexus runtime binary byte for byte.
+0.82 validation scope
+
+The original main ASI and Microsoft-ABI interposer compiled successfully.
+Native queue allocation regressions and exported-symbol comparison passed.
+Isolated initialization loaded matching plugins with the RTX30 core.
+On RTX3050 Laptop, a real Vulkan device was created with the observed 1/8/2 host queue request;
+device creation and shutdown completed successfully. No game or swapchain was launched.
+Runtime ZIP integrity, paths, backend and diagnostics defaults were checked.
+
+Still requiring gameplay validation: affected RTX5070Ti startup, RTX20 generation,
+cutscene transitions, provider/multiplier cadence, HDR and restart/graphics transitions.
+Universal crash freedom or performance is not established.
+See docs/MAINTAINER-NOTES.md for details.

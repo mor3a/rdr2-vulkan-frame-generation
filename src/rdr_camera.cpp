@@ -1,51 +1,30 @@
 #include "rdr_camera.h"
 #include "log.h"
+#include "runtime_errors.h"
+#include "neutral_camera.h"
+#include "config.h"
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <algorithm>
+#include <cstdio>
+#include <array>
 namespace fgvk {
-using NativeInit=void(*)(unsigned long long);
-using NativePush=void(*)(unsigned long long);
-using NativeCall=unsigned long long*(*)();
-using ScriptWait=void(*)(DWORD);
-using ScriptRegister=void(*)(HMODULE,void(*)());
-static NativeInit init=nullptr;static NativePush push=nullptr;static NativeCall call=nullptr;static ScriptWait wait=nullptr;
+static std::atomic<bool> cameraErrors[RuntimeErrors::Capacity]{};
+static void CameraError(RuntimeErrors::Code code,const char* detail){RuntimeErrors::ReportError(code,detail);if(!cameraErrors[(unsigned)code].exchange(true))Log("%s %s",RuntimeErrors::CodeId(code),detail);}
+static void CameraRecovered(RuntimeErrors::Code code){RuntimeErrors::ClearError(code);if(cameraErrors[(unsigned)code].exchange(false))Log("%s recovered",RuntimeErrors::CodeId(code));}
 struct Vec {float x=0,y=0,z=0;};
-struct Snapshot {Vec position,rotation;float fov=0;ULONGLONG time=0;bool valid=false;};
-static Snapshot camera;static std::mutex cameraMutex;
-// ABI from the RDR2 ScriptHook SDK: vector components occupy separate 8-byte slots.
-static Vec Vector(unsigned long long hash,bool arg=false,unsigned long long value=0){
-  init(hash);if(arg)push(value);auto result=call();Vec v{};
-  if(result){std::memcpy(&v.x,result,4);std::memcpy(&v.y,result+1,4);std::memcpy(&v.z,result+2,4);}return v;
-}
-static bool Finite(Vec v){return std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z);}
-static void CameraScript(){
-  bool logged=false;
-  while(true){
-    Snapshot s;
-    s.position=Vector(0x5352E025EC2B416FULL);
-    s.rotation=Vector(0x602685BD85DD26CAULL,true,2); // ZXY rotation order
-    init(0x04AF77971E508F6AULL);auto result=call();if(result)std::memcpy(&s.fov,result,4);
-    s.valid=Finite(s.position)&&Finite(s.rotation)&&std::isfinite(s.fov)&&s.fov>1.f&&s.fov<175.f;
-    s.time=GetTickCount64();
-    {std::lock_guard<std::mutex> lock(cameraMutex);camera=s;}
-    if(s.valid&&!logged){logged=true;Log("RDR2 native camera available: FOV=%.2f position=(%.2f,%.2f,%.2f)",s.fov,s.position.x,s.position.y,s.position.z);}
-    wait(0);
-  }
-}
-template<class T>static T Resolve(HMODULE module,const char* plain,const char* decorated){
-  FARPROC p=GetProcAddress(module,plain);if(!p)p=GetProcAddress(module,decorated);return reinterpret_cast<T>(p);
-}
-bool RegisterRdrCamera(HMODULE self){
-  HMODULE sdk=GetModuleHandleA("ScriptHookRDR2.dll");if(!sdk){Log("ScriptHook not loaded: native camera required for FG");return false;}
-  init=Resolve<NativeInit>(sdk,"nativeInit","?nativeInit@@YAX_K@Z");
-  push=Resolve<NativePush>(sdk,"nativePush64","?nativePush64@@YAX_K@Z");
-  call=Resolve<NativeCall>(sdk,"nativeCall","?nativeCall@@YAPEA_KXZ");
-  wait=Resolve<ScriptWait>(sdk,"scriptWait","?scriptWait@@YAXK@Z");
-  auto reg=Resolve<ScriptRegister>(sdk,"scriptRegister","?scriptRegister@@YAXPEAUHINSTANCE__@@P6AXXZ@Z");
-  if(!init||!push||!call||!wait||!reg){Log("ScriptHook camera API unavailable");return false;}
-  reg(self,CameraScript);Log("RDR2 camera fiber registered");return true;
+struct Snapshot {Vec position,rotation;float fov=0;ULONGLONG time=0;uint64_t timeUs=0;bool valid=false;};
+static Snapshot camera;static std::array<Snapshot,64> poseRing{};static size_t poseNext{};static std::mutex cameraMutex;
+bool RegisterRdrCamera(HMODULE){return false;}
+uint64_t CameraNowUs(){static const double factor=[](){LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return 1000000./f.QuadPart;}();LARGE_INTEGER q{};QueryPerformanceCounter(&q);return uint64_t(q.QuadPart*factor);}
+bool ReadCameraPoseAt(uint64_t target,uint64_t previous,uint32_t maxAgeMs,CameraPose& out){
+ std::lock_guard<std::mutex> guard(cameraMutex);const Snapshot* best=nullptr;
+ for(const auto& pose:poseRing)if(pose.valid && CameraTimeEligible(pose.timeUs,target,previous,maxAgeMs) && (!best || pose.timeUs>best->timeUs))best=&pose;
+ out={};if(!best)return false;
+ out.position[0]=best->position.x;out.position[1]=best->position.y;out.position[2]=best->position.z;
+ out.rotation[0]=best->rotation.x;out.rotation[1]=best->rotation.y;out.rotation[2]=best->rotation.z;
+ out.fov=best->fov;out.timeUs=best->timeUs;out.valid=true;return true;
 }
 struct Matrix {float m[4][4]{};};
 static Matrix Identity(){Matrix r;for(int i=0;i<4;i++)r.m[i][i]=1.f;return r;}
@@ -64,11 +43,35 @@ static bool Inverse(const Matrix& a,Matrix& inverse){
 static sl::float4x4 ToSl(const Matrix& m){sl::float4x4 r{};for(int i=0;i<4;i++)r.setRow(i,{m.m[i][0],m.m[i][1],m.m[i][2],m.m[i][3]});return r;}
 static float Dot(Vec a,Vec b){return a.x*b.x+a.y*b.y+a.z*b.z;}
 static Vec AddScaled(Vec a,float sa,Vec b,float sb){return {a.x*sa+b.x*sb,a.y*sa+b.y*sb,a.z*sa+b.z*sb};}
-bool ApplyRdrCamera(sl::Constants& c,float aspect,bool invertedDepth,bool reset){
+static Matrix acceptedCamera{}, pendingCamera{};
+static Snapshot acceptedPose{}, pendingPose{};
+static bool haveAcceptedCamera=false,havePendingCamera=false;
+static std::atomic<bool> historyInterrupted{false};
+void InvalidateRdrCameraHistory(){historyInterrupted.store(true,std::memory_order_release);}
+void CommitRdrCamera(bool accepted){
+  if(accepted && havePendingCamera){acceptedCamera=pendingCamera;acceptedPose=pendingPose;haveAcceptedCamera=true;}
+  else if(!accepted)InvalidateRdrCameraHistory();
+  havePendingCamera=false;
+}
+bool ApplyNeutralCamera(sl::Constants& c,float aspect,bool invertedDepth,bool reset,bool historyProtection){
+  havePendingCamera=false;
+  const bool interrupted=historyInterrupted.exchange(false,std::memory_order_acq_rel);
+  if(!BuildNeutralCamera(c,aspect,invertedDepth,reset || !haveAcceptedCamera || (historyProtection && interrupted)))return false;
+  // Keep the existing accepted-input/reset bookkeeping without sampling a pose.
+  pendingCamera=Identity();pendingPose=Snapshot{};havePendingCamera=true;
+  static bool noted=false;
+  if(!noted){noted=true;Log("DLSS-G camera source=neutral; ScriptHook camera unused; nominal FOV=60 near=0.05 far=10000; real motion comes from NGX motion vectors");}
+  return true;
+}
+bool ApplyRdrCamera(sl::Constants& c,float aspect,bool invertedDepth,bool reset,bool historyProtection,bool requireFreshPose){
+  havePendingCamera=false;
+
   Snapshot s;{std::lock_guard<std::mutex> lock(cameraMutex);s=camera;}
-  if(!s.valid||GetTickCount64()-s.time>250||!std::isfinite(aspect)||aspect<=0)return false;
+  if(!s.valid||(requireFreshPose && GetTickCount64()-s.time>250)||!std::isfinite(s.fov)||s.fov<=1.f||s.fov>=179.f||!std::isfinite(aspect)||aspect<=0){char detail[256];snprintf(detail,sizeof(detail),"Camera valid=%d ageMs=%llu FOV=%.3f aspect=%.4f",s.valid,(unsigned long long)(s.time?GetTickCount64()-s.time:0),s.fov,aspect);CameraError(RuntimeErrors::Code::CameraStale,detail);return false;}
+  // Use the captured pose, not a wall-clock extrapolation unrelated to GPU frame time.
+  Vec posePos=s.position,poseRot=s.rotation;
   constexpr float rad=0.017453292519943295f;
-  float pitch=s.rotation.x*rad,roll=s.rotation.y*rad,yaw=s.rotation.z*rad;
+  float pitch=poseRot.x*rad,roll=poseRot.y*rad,yaw=poseRot.z*rad;
   float cp=std::cos(pitch),sp=std::sin(pitch),cy=std::cos(yaw),sy=std::sin(yaw);
   Vec forward{-sy*cp,cy*cp,sp};Vec baseRight{cy,sy,0};Vec baseUp{sy*sp,-cy*sp,cp};
   Vec right=AddScaled(baseRight,std::cos(roll),baseUp,-std::sin(roll));
@@ -77,7 +80,7 @@ bool ApplyRdrCamera(sl::Constants& c,float aspect,bool invertedDepth,bool reset)
   view.m[0][0]=right.x;view.m[0][1]=up.x;view.m[0][2]=forward.x;
   view.m[1][0]=right.y;view.m[1][1]=up.y;view.m[1][2]=forward.y;
   view.m[2][0]=right.z;view.m[2][1]=up.z;view.m[2][2]=forward.z;
-  view.m[3][0]=-Dot(s.position,right);view.m[3][1]=-Dot(s.position,up);view.m[3][2]=-Dot(s.position,forward);
+  view.m[3][0]=-Dot(posePos,right);view.m[3][1]=-Dot(posePos,up);view.m[3][2]=-Dot(posePos,forward);
   // Near/farPlane are explicit fallbacks until engine projection extraction is available.
   // FOV and the view transform come from the actual final rendered camera.
   float nearPlane=0.05f,farPlane=10000.f,fov=s.fov*rad,f=1.f/std::tan(fov*0.5f);
@@ -85,18 +88,26 @@ bool ApplyRdrCamera(sl::Constants& c,float aspect,bool invertedDepth,bool reset)
   projection.m[2][2]=invertedDepth?nearPlane/(nearPlane-farPlane):farPlane/(farPlane-nearPlane);
   projection.m[3][2]=invertedDepth?nearPlane*farPlane/(farPlane-nearPlane):-nearPlane*farPlane/(farPlane-nearPlane);
   Matrix invProjection{},current=Multiply(view,projection),invCurrent{};
-  if(!Inverse(projection,invProjection)||!Inverse(current,invCurrent))return false;
-  static Matrix previous{};static Snapshot last{};static bool hadPrevious=false;
+  if(!Inverse(projection,invProjection)||!Inverse(current,invCurrent)){CameraError(RuntimeErrors::Code::CameraStale,"Camera projection or view-projection matrix cannot be inverted.");return false;}
+  CameraRecovered(RuntimeErrors::Code::CameraStale);
+  Matrix previous=acceptedCamera;Snapshot last=acceptedPose;bool hadPrevious=haveAcceptedCamera;
+  const bool interrupted=historyInterrupted.exchange(false,std::memory_order_acq_rel);
+  reset=reset || (historyProtection && interrupted);
+  if(historyProtection && interrupted){static unsigned count=0;++count;if(count==1 || (count&(count-1))==0)Log("FG history protection: reset after rejected/dropped input; occurrences=%u",count);}
   Vec delta{s.position.x-last.position.x,s.position.y-last.position.y,s.position.z-last.position.z};
   bool cut=reset||!hadPrevious||Dot(delta,delta)>2500.f||std::abs(s.fov-last.fov)>20.f;
   Matrix invPrevious{};if(cut||!Inverse(previous,invPrevious)){previous=current;invPrevious=invCurrent;}
   c.cameraViewToClip=ToSl(projection);c.clipToCameraView=ToSl(invProjection);
-  c.clipToPrevClip=ToSl(Multiply(invCurrent,previous));c.prevClipToClip=ToSl(Multiply(invPrevious,current));
-  c.cameraPos={s.position.x,s.position.y,s.position.z};c.cameraRight={right.x,right.y,right.z};
+  c.clipToLensClip=ToSl(Identity());
+  // Streamline requires the current-to-previous clip transform even when the
+  // motion-vector buffer includes camera motion. Reset frames use identity.
+  c.clipToPrevClip=ToSl(Multiply(invCurrent,previous));
+  c.prevClipToClip=ToSl(Multiply(invPrevious,current));
+  c.cameraPos={posePos.x,posePos.y,posePos.z};c.cameraRight={right.x,right.y,right.z};
   c.cameraUp={up.x,up.y,up.z};c.cameraFwd={forward.x,forward.y,forward.z};
   c.cameraNear=nearPlane;c.cameraFar=farPlane;c.cameraFOV=fov;c.cameraAspectRatio=aspect;
   c.reset=cut?sl::Boolean::eTrue:sl::Boolean::eFalse;
-  previous=current;last=s;hadPrevious=true;return true;
+  pendingCamera=current;pendingPose=s;havePendingCamera=true;return true;
 }
 }
 

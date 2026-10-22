@@ -3,8 +3,11 @@
 #include <mutex>
 #include <unordered_map>
 #include <cstring>
+#include "config.h"
 namespace fgvk {
 void HudCaptureForgetCommand(VkCommandBuffer);
+void ForgetFGCommand(VkCommandBuffer);
+void ExecuteFGCommands(VkCommandBuffer,uint32_t,const VkCommandBuffer*);
 struct ImageState {
   VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
   VkImageUsageFlags usage=0;
@@ -67,7 +70,8 @@ inline VKAPI_ATTR VkResult VKAPI_CALL TrackCreateImage(VkDevice d,const VkImageC
   VkResult r=resource_detail::createImage(d,ci,a,image);
   if(r==VK_SUCCESS && image && ci){
     std::lock_guard<std::mutex> lock(resource_detail::mutex);
-    resource_detail::images[*image]={ci->initialLayout,ci->usage,ci->format,ci->extent.width,ci->extent.height};
+    if(!IsDX12Bridge(Cfg().provider) || !resource_detail::images.count(*image))
+      resource_detail::images[*image]={ci->initialLayout,ci->usage,ci->format,ci->extent.width,ci->extent.height};
   }return r;
 }
 inline VKAPI_ATTR void VKAPI_CALL TrackDestroyImage(VkDevice d,VkImage image,const VkAllocationCallbacks* a){
@@ -76,13 +80,13 @@ inline VKAPI_ATTR void VKAPI_CALL TrackDestroyImage(VkDevice d,VkImage image,con
   resource_detail::destroyImage(d,image,a);
 }
 inline VKAPI_ATTR VkResult VKAPI_CALL TrackBegin(VkCommandBuffer c,const VkCommandBufferBeginInfo* bi){
-  ForgetCommand(c);HudCaptureForgetCommand(c);return resource_detail::beginCommand(c,bi);
+  ForgetCommand(c);ForgetFGCommand(c);HudCaptureForgetCommand(c);return resource_detail::beginCommand(c,bi);
 }
 inline VKAPI_ATTR VkResult VKAPI_CALL TrackReset(VkCommandBuffer c,VkCommandBufferResetFlags flags){
-  ForgetCommand(c);HudCaptureForgetCommand(c);return resource_detail::resetCommand(c,flags);
+  ForgetCommand(c);ForgetFGCommand(c);HudCaptureForgetCommand(c);return resource_detail::resetCommand(c,flags);
 }
 inline VKAPI_ATTR void VKAPI_CALL TrackFree(VkDevice d,VkCommandPool pool,uint32_t n,const VkCommandBuffer* cs){
-  for(uint32_t i=0;i<n;i++){ForgetCommand(cs[i]);HudCaptureForgetCommand(cs[i]);}resource_detail::freeCommands(d,pool,n,cs);
+  for(uint32_t i=0;i<n;i++){ForgetCommand(cs[i]);ForgetFGCommand(cs[i]);HudCaptureForgetCommand(cs[i]);}resource_detail::freeCommands(d,pool,n,cs);
 }
 inline VKAPI_ATTR void VKAPI_CALL TrackBarrier(VkCommandBuffer c,VkPipelineStageFlags src,VkPipelineStageFlags dst,
     VkDependencyFlags dep,uint32_t nm,const VkMemoryBarrier* m,uint32_t nb,const VkBufferMemoryBarrier* b,
@@ -108,7 +112,7 @@ inline VKAPI_ATTR void VKAPI_CALL TrackBeginPass2(VkCommandBuffer c,const VkRend
 inline VKAPI_ATTR void VKAPI_CALL TrackBeginPass2KHR(VkCommandBuffer c,const VkRenderPassBeginInfo* bi,const VkSubpassBeginInfo* si){ForgetCommand(c);resource_detail::beginPass2KHR(c,bi,si);}
 inline VKAPI_ATTR void VKAPI_CALL TrackEndPass2(VkCommandBuffer c,const VkSubpassEndInfo* si){resource_detail::endPass2(c,si);ForgetCommand(c);}
 inline VKAPI_ATTR void VKAPI_CALL TrackEndPass2KHR(VkCommandBuffer c,const VkSubpassEndInfo* si){resource_detail::endPass2KHR(c,si);ForgetCommand(c);}
-inline VKAPI_ATTR void VKAPI_CALL TrackExecute(VkCommandBuffer c,uint32_t n,const VkCommandBuffer* secondary){ForgetCommand(c);resource_detail::executeCommands(c,n,secondary);ForgetCommand(c);}
+inline VKAPI_ATTR void VKAPI_CALL TrackExecute(VkCommandBuffer c,uint32_t n,const VkCommandBuffer* secondary){ForgetCommand(c);resource_detail::executeCommands(c,n,secondary);ExecuteFGCommands(c,n,secondary);ForgetCommand(c);}
 inline VKAPI_ATTR void VKAPI_CALL TrackBeginRendering(VkCommandBuffer c,const VkRenderingInfo* ri){ForgetCommand(c);resource_detail::beginRendering(c,ri);}
 inline VKAPI_ATTR void VKAPI_CALL TrackBeginRenderingKHR(VkCommandBuffer c,const VkRenderingInfo* ri){ForgetCommand(c);resource_detail::beginRenderingKHR(c,ri);}
 inline VKAPI_ATTR void VKAPI_CALL TrackEndRendering(VkCommandBuffer c){resource_detail::endRendering(c);ForgetCommand(c);}

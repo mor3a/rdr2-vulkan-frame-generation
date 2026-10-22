@@ -8,6 +8,8 @@
 #include "config.h"
 #include "performance_probe.h"
 #include "latency_imports.h"
+#include "runtime_errors.h"
+#include "ampere_boot.h"
 
 #include <sl.h>
 #include <sl_helpers_vk.h>
@@ -16,6 +18,7 @@
 #include <sl_consts.h>
 #include <vector>
 #include <string>
+#include <cstdio>
 #include <algorithm>
 #include <mutex>
 #include <detours.h>
@@ -108,7 +111,7 @@ static PFun_slDLSSGGetState* p_slDLSSGGetState{};
 // before this ran, found nothing next to RDR2.exe, and the game failed to create its instance.
 static HMODULE LoadInterposer(){
   if(g_sl) return g_sl;
-  if(GetModuleHandleA("sl.interposer.dll")){Log("Another interposer is loaded; refusing mixed runtime");return nullptr;}
+  if(GetModuleHandleA("sl.interposer.dll")){Log("Another interposer is loaded; refusing mixed runtime");RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Another Streamline interposer is already loaded; mixed runtime refused");return nullptr;}
   HMODULE self{}; GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCWSTR)&LoadInterposer,&self);
   wchar_t dir[MAX_PATH]{}; GetModuleFileNameW(self, dir, MAX_PATH); wchar_t* s=wcsrchr(dir,L'\\'); if(s) *(s+1)=0;
   wchar_t interposer[MAX_PATH]; swprintf(interposer, MAX_PATH, L"%sRDR2VulkanFG\\Streamline\\sl.interposer.dll", dir);
@@ -117,22 +120,23 @@ static HMODULE LoadInterposer(){
     g_sl = LoadLibraryExW(interposer,nullptr,LOAD_WITH_ALTERED_SEARCH_PATH);
     Log("Streamline runtime: %S (%s)", s_slDir, g_sl?"loaded":"LOAD FAILED");
   }
-  if(!g_sl){s_slDir[0]=0;Log("Private Streamline runtime not available; root DLL not substituted");}
+  if(!g_sl){auto native=GetLastError();s_slDir[0]=0;Log("Private Streamline runtime not available; root DLL not substituted");RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Bundled Streamline interposer is missing or could not load",(int)native);}
   return g_sl;
 }
 
 // Resolves slInit/slSetVulkanInfo/slGetFeatureFunction from the interposer module
 // and calls slInit once. Returns true if slInit succeeded.
 static std::mutex g_slInitMutex;
-static bool EnsureSlInit(){
+static bool EnsureSlInit(sl::RenderAPI api=sl::RenderAPI::eVulkan){
   std::lock_guard<std::mutex> lock(g_slInitMutex);
   static bool s_tried = false;
   static bool s_armed = false;
-  if(s_tried) return s_armed;
+  static sl::RenderAPI initializedAPI=api;
+  if(s_tried) return s_armed && initializedAPI==api;
   s_tried = true;
 
   if(!LoadInterposer()){ Log("EnsureSlInit: sl.interposer.dll not found - put the Streamline folder next to fgvk.dll"); return false; }
-  if(!PinLocalPlugins()){Log("Local plugin pin failed; leaving Vulkan creation native");return false;}
+  if(!PinLocalPlugins()){Log("Local plugin pin failed; leaving Vulkan creation native");RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Local Streamline plugin routing could not be installed");return false;}
 
   p_slInit = (PFun_slInit*)GetProcAddress(g_sl, "slInit");
   p_slSetVulkanInfo = (PFun_slSetVulkanInfo*)GetProcAddress(g_sl, "slSetVulkanInfo");
@@ -141,6 +145,7 @@ static bool EnsureSlInit(){
       (void*)p_slInit, (void*)p_slSetVulkanInfo, (void*)p_slGetFeatureFunction);
   if(!p_slInit || !p_slSetVulkanInfo || !p_slGetFeatureFunction){
     Log("EnsureSlInit: failed to resolve core SL functions");
+    RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Bundled interposer is missing required core exports");
     return false;
   }
 
@@ -158,14 +163,14 @@ static bool EnsureSlInit(){
   p.flags = sl::PreferenceFlags::eDisableCLStateTracking
           | sl::PreferenceFlags::eUseManualHooking
           | sl::PreferenceFlags::eUseFrameBasedResourceTagging;   // slSetTagForFrame needs this
-  p.renderAPI = sl::RenderAPI::eVulkan;
+  p.renderAPI = api;
   // RDR2's own observed/authorized NGX application ID is required.
   // A BG3 identity must not silently stand in for RDR2.
   p.applicationId = Cfg().applicationId;
   // Streamline's own verbose log - written next to the game exe; names the exact
   // internal step DLSS-G is on when something wedges.
-  p.logLevel = sl::LogLevel::eVerbose;
-  p.logMessageCallback=[](sl::LogType type,const char* message){Log("[Streamline type=%u] %s",(unsigned)type,message?message:"<empty>");};
+  p.logLevel = Cfg().debugLogging?sl::LogLevel::eVerbose:sl::LogLevel::eOff;
+  p.logMessageCallback=[](sl::LogType type,const char* message){if(type==sl::LogType::eError)Log("[Streamline error] %s",message?message:"<empty>");else LogDebug("[Streamline type=%u] %s",(unsigned)type,message?message:"<empty>");};
   // sl.log next to RDR2.exe (wherever the game is installed)
   static wchar_t s_logDir[MAX_PATH]{};
   { GetModuleFileNameW(nullptr, s_logDir, MAX_PATH); wchar_t* s=wcsrchr(s_logDir,L'\\'); if(s) *s=0; }
@@ -183,20 +188,23 @@ static bool EnsureSlInit(){
   sl::Result r = p_slInit(p, sl::kSDKVersion);
   Log("slInit -> %d", (int)r);
   s_armed = (r == sl::Result::eOk);
+  if(!s_armed)RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"slInit failed",(int)r);
   if(s_armed){
     const wchar_t* names[]={L"sl.common.dll",L"sl.pcl.dll",L"sl.reflex.dll",L"sl.dlss_g.dll"};
     for(auto name:names){
       if(!LocalPluginLoaded(name)){
         Log("Refusing mixed or missing Streamline plugin: %S; native Vulkan fallback",name);
+        RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"A required Streamline plugin is missing or loaded from an unexpected directory");
         auto shutdown=(PFun_slShutdown*)GetProcAddress(g_sl,"slShutdown");if(shutdown)shutdown();
         s_armed=false;break;
       }
     }
-    if(s_armed && !BindBundledLatency()){
+    if(s_armed && api==sl::RenderAPI::eVulkan && !BindBundledLatency()){
       auto shutdown=(PFun_slShutdown*)GetProcAddress(g_sl,"slShutdown");if(shutdown)shutdown();s_armed=false;
       Log("Latency dependency unavailable; native Vulkan fallback");
+      RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Bundled latency dependency could not satisfy Streamline imports");
     }
-    if(s_armed)Log("Matched local Streamline plugins verified before Vulkan device creation");
+    if(s_armed){Log("Matched local Streamline plugins verified before Vulkan device creation");RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderInit);}
   }
   return s_armed;
 }
@@ -210,12 +218,14 @@ static bool EnsureSlInit(){
 static std::mutex g_featureMutex;
 static bool EnsureFeatureFunctions(){
   std::lock_guard<std::mutex> lock(g_featureMutex);
-  static bool s_tried = false;
   static bool s_ok = false;
-  if(s_tried) return s_ok;
-  s_tried = true;
+  static ULONGLONG nextAttempt=0;
+  if(s_ok)return true;
+  const auto now=GetTickCount64();
+  if(now<nextAttempt)return false;
+  nextAttempt=now+2000;
 
-  if(!p_slGetFeatureFunction){ Log("EnsureFeatureFunctions: slGetFeatureFunction not resolved"); return false; }
+  if(!p_slGetFeatureFunction){ Log("EnsureFeatureFunctions: slGetFeatureFunction not resolved");RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"Feature lookup export is unavailable"); return false; }
 
   void* fn = nullptr;
   sl::Result r;
@@ -251,18 +261,24 @@ static bool EnsureFeatureFunctions(){
       (void*)g_slFns.pclSetMarker,(void*)g_slFns.reflexSleep);
   p_slDLSSGGetState = (PFun_slDLSSGGetState*)fn;
 
-  s_ok = p_slReflexSetOptions && p_slDLSSGSetOptions && p_slDLSSGGetState;
-  if(!s_ok) Log("EnsureFeatureFunctions: one or more feature functions failed to resolve");
+  s_ok = p_slReflexSetOptions && p_slDLSSGSetOptions && p_slDLSSGGetState
+      && g_slFns.getNewFrameToken && g_slFns.setTagForFrame
+      && g_slFns.setConstants && g_slFns.pclSetMarker;
+  if(!s_ok){Log("EnsureFeatureFunctions: one or more feature functions failed to resolve");RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"One or more DLSS-G or Reflex feature functions could not be resolved",(int)r);}
+  else RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderInit);
   return s_ok;
 }
 
 bool EnsureStreamlineInit(){ return EnsureSlInit(); }
+bool EnsureStreamlineD3D12Init(){ return EnsureSlInit(sl::RenderAPI::eD3D12); }
 void* SlProxyFn(const char* name){
   HMODULE m = LoadInterposer();
   return m ? (void*)GetProcAddress(m, name) : nullptr;
 }
 
+static std::atomic<bool> g_deviceFeaturesReady{false};
 void OnDeviceCreated(){
+  if(g_deviceFeaturesReady.load())return;
   // Full interposition: the interposer created + owns the device and its queues (its own
   // surgery). NO slSetVulkanInfo, NO device surgery - those double-register an interposer
   // device and caused every crash/queue-rejection before. We only enable the features.
@@ -276,10 +292,20 @@ void OnDeviceCreated(){
 
   // DLSS-G requires Reflex ON. Set Reflex now; DLSS-G is enabled later by the eval-driven gate.
   sl::ReflexOptions ro{};
-  ro.mode = Cfg().reflexMode==0 ? sl::ReflexMode::eOff : Cfg().reflexMode==1 ? sl::ReflexMode::eLowLatency
+  ro.mode = Cfg().reflexMode!=2 ? sl::ReflexMode::eLowLatency
                                 : sl::ReflexMode::eLowLatencyWithBoost;   // PureDark config: mReflexMode=2 (Boost), no cap
   sl::Result rReflex = p_slReflexSetOptions(ro);
   Log("slReflexSetOptions(mode=%d) -> %d (DLSS-G itself waits for the eval-driven gate)", Cfg().reflexMode, (int)rReflex);
+  g_deviceFeaturesReady.store(rReflex==sl::Result::eOk);
+}
+
+void ApplyNativeFrameBudget(){
+ static uint32_t previous=UINT32_MAX;
+ const auto state=GetFGSnapshot();
+ const uint32_t desired=FrameBudgetUs(Rt().fpsCap.load(),Rt().outputFPSCap.load(),state.requested && state.accepted?Rt().frames+1:1);
+ if(!p_slReflexSetOptions || desired==previous)return;
+ sl::ReflexOptions options{};options.mode=Cfg().reflexMode==2?sl::ReflexMode::eLowLatencyWithBoost:sl::ReflexMode::eLowLatency;options.frameLimitUs=desired;
+ if(p_slReflexSetOptions(options)==sl::Result::eOk)previous=desired;
 }
 
 // Enable/suspend DLSS-G generation. Driven by the eval-driven gate in vkhooks (on the present
@@ -287,47 +313,189 @@ void OnDeviceCreated(){
 // eOff frees every FG resource and the next eOn re-creates the feature, a ~140ms frame that
 // Streamline itself flags as "Frame rate over 100ms". Both fatal WaitSemaphores timeouts in
 // the 09-03 logs sit inside that free/re-create cycle. Guide 6.4: "strongly recommended".
-static uint32_t g_framesMax = 0;                 // DLSSGState::numFramesToGenerateMax (0 = not read yet)
+static uint32_t g_framesMax = 0;
+static std::mutex g_stateMutex;
+static FGSnapshot g_fgState;
+static uint32_t g_windowPolls{},g_windowValid{};
+static uint64_t g_windowShown{};
+static uint32_t g_zeroTelemetryPolls{};
+FGSnapshot GetFGSnapshot(){std::lock_guard<std::mutex> lock(g_stateMutex);return g_fgState;}
 
-void SetDLSSGeneration(bool on){
-  if(!p_slDLSSGSetOptions) return;
+static void OnDLSSGApiError(const sl::APIError& error){
+  RuntimeErrors::ReportError(RuntimeErrors::Code::PresentFailed,"DLSS-G reported an underlying Vulkan present/acquire failure",(int)error.vkRes);
+  Log("DLSS-G API error callback: vkRes=%d",(int)error.vkRes);
+}
+bool SetDLSSGeneration(bool on){
+  if(on && !g_deviceFeaturesReady.load()){
+    RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderInit,"DLSS-G enable deferred until feature functions and Reflex initialization succeed");
+    return false;
+  }
+  {std::lock_guard<std::mutex> lock(g_stateMutex);g_fgState.requested=on;++g_fgState.optionCalls;}
+  if(!p_slDLSSGSetOptions){
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_fgState.optionsResult=-1;g_fgState.state=FGState::Error;
+    RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"slDLSSGSetOptions is unavailable; generation cannot be requested");
+    return false;
+  }
   sl::DLSSGOptions o{};
   o.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
   uint32_t n = Rt().frames; if(n<1) n=1; if(g_framesMax && n > g_framesMax) n = g_framesMax;
   o.numFramesToGenerate = n;
-  o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+  o.flags = sl::DLSSGFlags::eRetainResourcesWhenOff | sl::DLSSGFlags::eEnableFullscreenMenuDetection;
+  o.onErrorCallback = &OnDLSSGApiError;
+  // Native HUD capture supplies a HUD-less scene, not a UI alpha layer.
+  // Do not enable recomposition using the old transparent placeholder.
+  o.enableUserInterfaceRecomposition = Cfg().tagUI && !Cfg().nativeHudProtection ? sl::Boolean::eTrue : sl::Boolean::eFalse;
   sl::ViewportHandle vp{0};
   sl::Result r = p_slDLSSGSetOptions(vp, o);
-  if(r==sl::Result::eOk)SetFPSGenerationActive(on);
+  const bool accepted=r==sl::Result::eOk || r==sl::Result::eWarnOutOfVRAM;
+  static_assert(static_cast<int>(sl::Result::eWarnOutOfVRAM)==39,"Update result classification for new SDK");
+  {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_fgState.optionsResult=(int)r;
+    if(accepted){g_fgState.accepted=on;g_fgState.measuredRatio=0;g_windowPolls=g_windowValid=0;g_windowShown=0;g_zeroTelemetryPolls=0;}
+    g_fgState.state=ClassifyFG(on,g_fgState.accepted,!accepted,false,0);
+  }
+  RuntimeErrors::SetWarning(RuntimeErrors::Warning::VRAM,r==sl::Result::eWarnOutOfVRAM);
+  RuntimeErrors::SetWarning(RuntimeErrors::Warning::Telemetry,false);
+  if(accepted){
+    UpdateMenuStats(g_framesMax,0,0);
+    SetFPSGenerationActive(on);
+    RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderOptions);
+  }else RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"slDLSSGSetOptions rejected the requested mode; see native result",(int)r);
   Log("SetDLSSGeneration(%d) frames=%u retainResources=1 -> %d", (int)on, n, (int)r);
+  return accepted;
 }
 
 // Present thread only (slDLSSGGetState is not thread safe and SL wants it synced with present).
 // Null options = status + frame stats only, no VRAM estimate (guide 13.0 / 17.0).
+static PFun_slIsFeatureSupported* p_slIsFeatureSupported{};
+void RearmDLSSGeneration(){
+  if(!p_slDLSSGSetOptions)return;
+  bool req=false;{std::lock_guard<std::mutex> lock(g_stateMutex);req=g_fgState.requested;}
+  if(req){Log("DLSS-G re-arm: options re-applied (preset/provider refresh)");SetDLSSGeneration(true);}
+}
+bool RestartNativeFGResources(unsigned preset){
+  if(Cfg().provider!=FGProvider::DLSSG || preset>3 || GetFGSnapshot().accepted){
+    RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"Native FG restart requires the feature to be disabled first");return false;
+  }
+  const auto freeResources=g_sl?(PFun_slFreeResources*)GetProcAddress(g_sl,"slFreeResources"):nullptr;
+  if(!freeResources){RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"slFreeResources is unavailable; FG restart cannot continue");return false;}
+  const auto result=freeResources(sl::kFeatureDLSS_G,sl::ViewportHandle{0});
+  if(!FGResultAccepted(int(result))){RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"Native DLSS-G resource reset failed",int(result));return false;}
+  // The feature is off and its viewport resources are gone. Keep the Vulkan
+  // device, swapchain and loaded plugin intact; the next valid input rebuilds FG.
+  const auto core=GetModuleHandleW(L"RTX40MFGCore.dll");
+  using SetPreset=BOOL(WINAPI*)(uint32_t);
+  const auto setPreset=core?(SetPreset)GetProcAddress(core,"MfgUnlockSetPreset"):nullptr;
+  if(setPreset){
+    if(!setPreset(preset)){RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"The loaded provider cannot apply this preset; check preset feedback and retry");return false;}
+    Rt().appliedPreset=int(preset);
+  }else if(int(preset)!=Rt().appliedPreset.load()){
+    RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderOptions,"Live preset control is unavailable on this provider; restore the loaded preset or use the NVIDIA profile and restart the game");return false;
+  }
+  RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderOptions);
+  RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderState);
+  RuntimeErrors::ClearError(RuntimeErrors::Code::ConstantsFailed);
+  RuntimeErrors::ClearError(RuntimeErrors::Code::FrameIndex);
+  Log("Native FG restart: viewport resources released; requested preset=%u; awaiting fresh SR inputs",preset);
+  return true;
+}
 void PollDLSSGState(){
-  if(!p_slDLSSGGetState) return;
+  if(!g_deviceFeaturesReady.load()){
+    static ULONGLONG retryAt=0;const auto now=GetTickCount64();
+    if(now>=retryAt){retryAt=now+2000;OnDeviceCreated();}
+    if(!g_deviceFeaturesReady.load())return;
+  }
+  if(!p_slDLSSGGetState){static bool reported=false;if(!reported){reported=true;RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderState,"slDLSSGGetState is unavailable; displayed FPS is not verified");}return;}
+  if(!p_slIsFeatureSupported)p_slIsFeatureSupported=(PFun_slIsFeatureSupported*)GetProcAddress(g_sl,"slIsFeatureSupported");
+  { static bool supportQueried=false;
+    if(!supportQueried && p_slIsFeatureSupported){
+      supportQueried=true;
+      sl::AdapterInfo adapter{};adapter.vkPhysicalDevice=(void*)gPhysicalDevice;
+      auto sr=p_slIsFeatureSupported(sl::kFeatureDLSS_G,adapter);
+      std::lock_guard<std::mutex> lock(g_stateMutex);
+      g_fgState.dlssgSupportKnown=true;g_fgState.dlssgSupported=(sr==sl::Result::eOk);
+      Log("DLSS-G support query: result=%d supported=%d",(int)sr,(int)g_fgState.dlssgSupported);
+    } }
   sl::DLSSGState st{};
+  bool doRearm=false;float rearmRatio=0;
   sl::ViewportHandle vp{0};
   auto result=p_slDLSSGGetState(vp, st, nullptr);
-  if(result!=sl::Result::eOk){static auto lastResult=sl::Result::eOk;if(lastResult!=result){lastResult=result;Log("DLSS-G statistics unavailable: result=%d; game FPS sampling continues",(int)result);}return;}
-  RecordDisplayedFrames(st.numFramesActuallyPresented);
-  PerformanceProbeDisplayed(st.numFramesActuallyPresented);
-  if(st.numFramesToGenerateMax) g_framesMax = st.numFramesToGenerateMax;
+  const bool valid=result==sl::Result::eOk || result==sl::Result::eWarnOutOfVRAM;
+  {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    if(!g_fgState.accepted || (valid&&st.numFramesActuallyPresented>0))g_zeroTelemetryPolls=0;
+    else ++g_zeroTelemetryPolls;
+    RuntimeErrors::SetWarning(RuntimeErrors::Warning::Telemetry,g_fgState.accepted&&g_zeroTelemetryPolls>=60);
+  }
+  static int lastQueryResult=-1;
+  if((int)result!=lastQueryResult){
+    lastQueryResult=(int)result;
+    Log("slDLSSGGetState result=%d acceptedTelemetry=%u presented=%u status=0x%x framesMax=%u%s",(int)result,(unsigned)valid,st.numFramesActuallyPresented,(unsigned)st.status,st.numFramesToGenerateMax,result==sl::Result::eWarnOutOfVRAM?" warning=OutOfVRAM":"");
+  }
+  if(result==sl::Result::eWarnOutOfVRAM)RuntimeErrors::SetWarning(RuntimeErrors::Warning::VRAM,true);
+  if(valid){
+    RecordDisplayedFrames(st.numFramesActuallyPresented);
+    PerformanceProbeDisplayed(st.numFramesActuallyPresented);
+    if(st.numFramesToGenerateMax){
+      const uint32_t maximum=std::min(5u,st.numFramesToGenerateMax);
+      if(maximum!=g_framesMax)Log("DLSS-G multiplier capacity: GPU=%s generatedMax=%u exposed=%ux unlock=%s",GPUName(),st.numFramesToGenerateMax,maximum+1,GPUUnlockStatus());
+      g_framesMax=maximum;
+    }
+    if((uint32_t)st.status){
+      char detail[256];std::snprintf(detail,sizeof(detail),"DLSS-G status bits=0x%x: resolutionLow=%u reflexMissing=%u unsupportedHDR=%u invalidConstants=%u backbufferIndex=%u",(unsigned)st.status,!!((unsigned)st.status&1),!!((unsigned)st.status&2),!!((unsigned)st.status&4),!!((unsigned)st.status&8),!!((unsigned)st.status&16));
+      RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderState,detail,(int)st.status);
+    }else RuntimeErrors::ClearError(RuntimeErrors::Code::ProviderState);
+  }else RuntimeErrors::ReportError(RuntimeErrors::Code::ProviderState,"slDLSSGGetState failed; displayed FPS is not verified",(int)result);
   static uint32_t last = 0xFFFFFFFF;
-  if((uint32_t)st.status != last){
+  if(valid && (uint32_t)st.status != last){
     last = (uint32_t)st.status;
     Log("DLSSG status=%u framesMax=%u vsyncSupport=%u", (unsigned)st.status, st.numFramesToGenerateMax,
         (unsigned)st.bIsVsyncSupportAvailable);
   }
   // numFramesActuallyPresented = frames displayed since the previous GetState call, so summed
   // over N presents it is the real multiplier (x1 = nothing generated, ~x4 = MFG working).
-  static uint32_t polls = 0, shown = 0;
-  polls++; shown += st.numFramesActuallyPresented;
-  if(polls >= 300){
-    UpdateMenuStats(g_framesMax,(uint32_t)st.status,shown/(float)polls);
-    Log("FG stats: %u presents -> %u frames displayed (x%.2f) status=%u", polls, shown, shown/(double)polls, (unsigned)st.status);
-    polls = 0; shown = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    ++g_fgState.polls;++g_windowPolls;g_fgState.queryResult=(int)result;
+    if(valid){
+      if(result==sl::Result::eWarnOutOfVRAM)++g_fgState.queryWarnings;else ++g_fgState.querySuccess;
+      ++g_windowValid;g_windowShown+=st.numFramesActuallyPresented;
+      g_fgState.lastPresented=st.numFramesActuallyPresented;g_fgState.status=(uint32_t)st.status;
+    }else{++g_fgState.queryErrors;g_fgState.measuredRatio=0;}
+    // Publish after a short real observation window; 300 presents is for logging,
+    // not a prerequisite for the menu to acknowledge measured generation.
+    if(g_windowPolls>=30){
+      const bool measured=g_windowValid==g_windowPolls && g_windowShown>0;
+      g_fgState.measuredRatio=measured?float(g_windowShown)/g_windowPolls:0;
+      UpdateMenuStats(g_framesMax,g_fgState.status,g_fgState.measuredRatio);
+    }
+    if(g_windowPolls>=300){
+      // A missed query returns a cumulative count next time. Never divide that by
+      // successful queries only: the denominator is all game-present polls.
+      const bool measured=g_windowValid==g_windowPolls && g_windowShown>0;
+      g_fgState.measuredRatio=measured?float(g_windowShown)/g_windowPolls:0;
+      UpdateMenuStats(g_framesMax,g_fgState.status,g_fgState.measuredRatio);
+      Log("FG stats: polls=%u valid=%u displayed=%llu measuredRatio=%.3f optionsCalls=%llu queryOK=%llu queryWarn=%llu queryError=%llu optionsResult=%d queryResult=%d status=0x%x",g_windowPolls,g_windowValid,(unsigned long long)g_windowShown,g_fgState.measuredRatio,(unsigned long long)g_fgState.optionCalls,(unsigned long long)g_fgState.querySuccess,(unsigned long long)g_fgState.queryWarnings,(unsigned long long)g_fgState.queryErrors,g_fgState.optionsResult,g_fgState.queryResult,g_fgState.status);
+      g_windowPolls=g_windowValid=0;g_windowShown=0;
+    }
+    g_fgState.state=ClassifyFG(g_fgState.requested,g_fgState.accepted,!FGResultAccepted(g_fgState.optionsResult) || !valid || (valid&&(uint32_t)st.status!=0),g_fgState.measuredRatio>0,g_fgState.measuredRatio);
+    // Stuck-generation recovery: options accepted, inputs flowing, status OK,
+    // yet DLSS-G presents no generated frames for 5s (seen after an in-game
+    // DLSS quality change recreates the SR feature). Re-apply the options
+    // once so the plugin re-arms interpolation; 15s cooldown, no gate desync
+    // because requested/accepted bookkeeping is untouched.
+    { static ULONGLONG unmeasuredSince=0,lastRearm=0;const ULONGLONG nowMs=GetTickCount64();
+      const bool stuck=g_fgState.requested&&g_fgState.accepted&&g_fgState.measuredRatio<=1.01f&&(uint32_t)st.status==0;
+      if(stuck){ if(!unmeasuredSince)unmeasuredSince=nowMs;
+        else if(nowMs-unmeasuredSince>=5000&&nowMs-lastRearm>=15000){ lastRearm=nowMs;unmeasuredSince=0;doRearm=true;rearmRatio=g_fgState.measuredRatio; } }
+      else unmeasuredSince=0; }
   }
+  // SetDLSSGeneration locks g_stateMutex itself; calling it while this
+  // function's lock_guard held self-deadlocked the present thread (freeze
+  // after preset changes). Always re-arm after the lock is released.
+  if(doRearm){ Log("DLSS-G re-arm: accepted but not generating for 5s (ratio=%.3f); options re-applied",rearmRatio); SetDLSSGeneration(true); }
 }
 }
 

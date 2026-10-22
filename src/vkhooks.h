@@ -10,7 +10,8 @@ extern uint32_t gGraphicsFamily;
 
 void* DeviceFn(const char* name);
 void* LoaderFn(const char* name);
+VkResult SubmitInternalReadbackFence(VkQueue,VkFence);
 
-void InstallVkHooks();
+bool InstallVkHooks(bool frameGenerationAvailable=true);
 void RemoveVkHooks();
 }

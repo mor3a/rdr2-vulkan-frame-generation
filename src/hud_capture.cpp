@@ -1,5 +1,6 @@
 #include "hud_capture.h"
 #include "log.h"
+#include "config.h"
 #include "ffx_api/vk/ffx_api_vk.h"
 #include <detours.h>
 #include <algorithm>
@@ -10,7 +11,9 @@
 #include <vector>
 
 namespace fgvk {
+void XessCaptureLock();void XessCaptureUnlock();
 namespace {
+struct XessCaptureScope{bool on=IsDX12Bridge(Cfg().provider);XessCaptureScope(){if(on)XessCaptureLock();}~XessCaptureScope(){if(on)XessCaptureUnlock();}};
 struct ViewInfo { VkImage image{}; VkFormat format{}; VkImageSubresourceRange range{}; };
 struct FramebufferInfo { VkRenderPass pass{}; uint32_t width{}, height{}, layers{}; std::vector<VkImageView> views; };
 struct PassAttachment { VkFormat format{}; VkSampleCountFlagBits samples{}; VkAttachmentLoadOp load{}; VkImageLayout initial{}; bool color{}; };
@@ -22,6 +25,8 @@ std::unordered_map<VkImageView, ViewInfo> views;
 std::unordered_map<VkFramebuffer, FramebufferInfo> framebuffers;
 std::unordered_map<VkRenderPass, PassInfo> renderPasses;
 std::unordered_set<VkImage> swapchainImages;
+struct RetiredCapture {VkDevice device{};PFN_vkGetDeviceProcAddr get{};VkImage image{};VkDeviceMemory memory{};std::unordered_set<VkImage> sources;};
+std::unordered_map<uint64_t,RetiredCapture> retiredCaptures;
 std::unordered_set<VkCommandBuffer> captureCommands;
 
 VkDevice device{};
@@ -48,6 +53,9 @@ PFN_vkDestroyFramebuffer realDestroyFramebuffer{};
 PFN_vkCreateRenderPass realCreateRenderPass{};
 PFN_vkDestroyRenderPass realDestroyRenderPass{};
 PFN_vkCmdBeginRenderPass realBeginRenderPass{};
+PFN_vkCreateRenderPass2 realCreateRenderPass2{},realCreateRenderPass2KHR{};
+PFN_vkCmdBeginRenderPass2 realBeginRenderPass2{},realBeginRenderPass2KHR{};
+PFN_vkCmdBeginRendering realBeginRendering{},realBeginRenderingKHR{};
 
 template<class T> T DeviceFn(const char* name) { return gdpa && device ? reinterpret_cast<T>(gdpa(device, name)) : nullptr; }
 
@@ -96,6 +104,7 @@ bool CreateCaptureImage() {
   ci.imageType=VK_IMAGE_TYPE_2D; ci.format=captureFormat; ci.extent={captureExtent.width,captureExtent.height,1};
   ci.mipLevels=1; ci.arrayLayers=1; ci.samples=VK_SAMPLE_COUNT_1_BIT; ci.tiling=VK_IMAGE_TILING_OPTIMAL;
   ci.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+  if(IsDX12Bridge(Cfg().provider))ci.usage|=VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   if (families.size()>1) { ci.sharingMode=VK_SHARING_MODE_CONCURRENT; ci.queueFamilyIndexCount=(uint32_t)families.size(); ci.pQueueFamilyIndices=families.data(); }
   else ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
   ci.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
@@ -156,7 +165,7 @@ void RecordCapture(VkCommandBuffer cmd, VkImage source, VkImageLayout sourceLayo
   b[1].srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; b[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
   b[1].oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b[1].newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   barrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,2,b);
-  initializedLayout=true; capturedAvailable=true; capturedThisFrame=true;
+  initializedLayout=true; capturedAvailable=!IsDX12Bridge(Cfg().provider); capturedThisFrame=true;
   captureCommands.insert(cmd);
   if (!loggedCapture) { loggedCapture=true; Log("HUD capture first success: frame=%llu renderPass=%p framebuffer=%p",(unsigned long long)activeFrame,(void*)capturedPass,(void*)capturedFramebuffer); }
 }
@@ -193,6 +202,28 @@ VKAPI_ATTR void VKAPI_CALL WrapDestroyRenderPass(VkDevice d,VkRenderPass p,const
 VKAPI_ATTR void VKAPI_CALL WrapBeginRenderPass(VkCommandBuffer cmd,const VkRenderPassBeginInfo* begin,VkSubpassContents contents) {
   HudCaptureBeforePass(cmd,begin); auto fn=realBeginRenderPass; if(fn)fn(cmd,begin,contents);
 }
+VkResult CreatePass2(VkDevice d,const VkRenderPassCreateInfo2* ci,const VkAllocationCallbacks* a,VkRenderPass* out,PFN_vkCreateRenderPass2 fn){
+ auto result=fn(d,ci,a,out);if(result!=VK_SUCCESS || !ci || !out)return result;
+ PassInfo p;p.attachments.resize(ci->attachmentCount);
+ for(uint32_t i=0;i<ci->attachmentCount;++i){const auto& source=ci->pAttachments[i];auto& target=p.attachments[i];target.format=source.format;target.samples=source.samples;target.load=source.loadOp;target.initial=source.initialLayout;}
+ for(uint32_t i=0;i<ci->subpassCount;++i)for(uint32_t j=0;j<ci->pSubpasses[i].colorAttachmentCount;++j){auto at=ci->pSubpasses[i].pColorAttachments[j].attachment;if(at<p.attachments.size())p.attachments[at].color=true;}
+ std::lock_guard<std::mutex> guard(metadataMutex);renderPasses[*out]=std::move(p);return result;
+}
+VKAPI_ATTR VkResult VKAPI_CALL WrapCreatePass2(VkDevice d,const VkRenderPassCreateInfo2* c,const VkAllocationCallbacks* a,VkRenderPass* o){return CreatePass2(d,c,a,o,realCreateRenderPass2);}
+VKAPI_ATTR VkResult VKAPI_CALL WrapCreatePass2KHR(VkDevice d,const VkRenderPassCreateInfo2* c,const VkAllocationCallbacks* a,VkRenderPass* o){return CreatePass2(d,c,a,o,realCreateRenderPass2KHR);}
+VKAPI_ATTR void VKAPI_CALL WrapBeginPass2(VkCommandBuffer c,const VkRenderPassBeginInfo* i,const VkSubpassBeginInfo* s){HudCaptureBeforePass(c,i);realBeginRenderPass2(c,i,s);}
+VKAPI_ATTR void VKAPI_CALL WrapBeginPass2KHR(VkCommandBuffer c,const VkRenderPassBeginInfo* i,const VkSubpassBeginInfo* s){HudCaptureBeforePass(c,i);realBeginRenderPass2KHR(c,i,s);}
+void CaptureRendering(VkCommandBuffer c,const VkRenderingInfo* info){
+ XessCaptureScope ownership;std::lock_guard<std::mutex> guard(captureMutex);
+ if(!info || !captureImage || !activeFrame || capturedThisFrame || info->renderArea.offset.x || info->renderArea.offset.y ||
+    info->renderArea.extent.width!=captureExtent.width || info->renderArea.extent.height!=captureExtent.height || info->layerCount!=1 || info->viewMask)return;
+ VkImage image{};VkImageLayout layout{};
+ {std::lock_guard<std::mutex> metadata(metadataMutex);for(uint32_t i=0;i<info->colorAttachmentCount;++i){const auto& a=info->pColorAttachments[i];auto vi=views.find(a.imageView);
+   if(a.loadOp==VK_ATTACHMENT_LOAD_OP_LOAD && vi!=views.end() && vi->second.format==captureFormat && swapchainImages.count(vi->second.image)){image=vi->second.image;layout=a.imageLayout;break;}}}
+ if(image)RecordCapture(c,image,layout);
+}
+VKAPI_ATTR void VKAPI_CALL WrapRendering(VkCommandBuffer c,const VkRenderingInfo* i){CaptureRendering(c,i);realBeginRendering(c,i);}
+VKAPI_ATTR void VKAPI_CALL WrapRenderingKHR(VkCommandBuffer c,const VkRenderingInfo* i){CaptureRendering(c,i);realBeginRenderingKHR(c,i);}
 
 template<class T> void AttachExport(HMODULE vk,const char* name,T& target,void* detour) {
   target=reinterpret_cast<T>(GetProcAddress(vk,name)); if(target) DetourAttach(reinterpret_cast<PVOID*>(&target),detour);
@@ -224,6 +255,25 @@ void HudCaptureDestroy() {
   device={};physical={};gdpa=nullptr;captureFormat=VK_FORMAT_UNDEFINED;captureExtent={};
 }
 
+void HudCaptureRetire(uint64_t owner){
+  std::lock_guard<std::mutex> guard(captureMutex);
+  std::lock_guard<std::mutex> metadata(metadataMutex);
+  auto& retired=retiredCaptures[owner];retired.device=device;retired.get=gdpa;
+  retired.image=captureImage;retired.memory=captureMemory;retired.sources=std::move(swapchainImages);
+  captureImage={};captureMemory={};swapchainImages.clear();captureCommands.clear();
+  initializedLayout=capturedThisFrame=capturedAvailable=false;activeFrame=0;
+}
+void HudCaptureReleaseRetired(uint64_t owner){
+  std::lock_guard<std::mutex> guard(captureMutex);
+  std::lock_guard<std::mutex> metadata(metadataMutex);
+  auto found=retiredCaptures.find(owner);if(found==retiredCaptures.end())return;
+  const auto& r=found->second;
+  auto destroy=(PFN_vkDestroyImage)r.get(r.device,"vkDestroyImage");
+  auto free=(PFN_vkFreeMemory)r.get(r.device,"vkFreeMemory");
+  if(r.image)destroy(r.device,r.image,nullptr);if(r.memory)free(r.device,r.memory,nullptr);
+  retiredCaptures.erase(found);
+}
+
 PFN_vkVoidFunction HudCaptureWrap(const char* name,PFN_vkVoidFunction fn) {
   if (!name || !fn) return nullptr;
   if (!strcmp(name,"vkCreateImageView")) {realCreateImageView=(PFN_vkCreateImageView)fn;return (PFN_vkVoidFunction)WrapCreateImageView;}
@@ -233,6 +283,14 @@ PFN_vkVoidFunction HudCaptureWrap(const char* name,PFN_vkVoidFunction fn) {
   if (!strcmp(name,"vkCreateRenderPass")) {realCreateRenderPass=(PFN_vkCreateRenderPass)fn;return (PFN_vkVoidFunction)WrapCreateRenderPass;}
   if (!strcmp(name,"vkDestroyRenderPass")) {realDestroyRenderPass=(PFN_vkDestroyRenderPass)fn;return (PFN_vkVoidFunction)WrapDestroyRenderPass;}
   if (!strcmp(name,"vkCmdBeginRenderPass")) {realBeginRenderPass=(PFN_vkCmdBeginRenderPass)fn;return (PFN_vkVoidFunction)WrapBeginRenderPass;}
+  if(IsDX12Bridge(Cfg().provider)){
+   if(!strcmp(name,"vkCreateRenderPass2")){realCreateRenderPass2=(PFN_vkCreateRenderPass2)fn;return (PFN_vkVoidFunction)WrapCreatePass2;}
+   if(!strcmp(name,"vkCreateRenderPass2KHR")){realCreateRenderPass2KHR=(PFN_vkCreateRenderPass2)fn;return (PFN_vkVoidFunction)WrapCreatePass2KHR;}
+   if(!strcmp(name,"vkCmdBeginRenderPass2")){realBeginRenderPass2=(PFN_vkCmdBeginRenderPass2)fn;return (PFN_vkVoidFunction)WrapBeginPass2;}
+   if(!strcmp(name,"vkCmdBeginRenderPass2KHR")){realBeginRenderPass2KHR=(PFN_vkCmdBeginRenderPass2)fn;return (PFN_vkVoidFunction)WrapBeginPass2KHR;}
+   if(!strcmp(name,"vkCmdBeginRendering")){realBeginRendering=(PFN_vkCmdBeginRendering)fn;return (PFN_vkVoidFunction)WrapRendering;}
+   if(!strcmp(name,"vkCmdBeginRenderingKHR")){realBeginRenderingKHR=(PFN_vkCmdBeginRendering)fn;return (PFN_vkVoidFunction)WrapRenderingKHR;}
+  }
   return fn;
 }
 
@@ -246,6 +304,7 @@ void HudCaptureOnSubmit(uint32_t count,const VkCommandBuffer* commands){
 }
 
 void HudCaptureBeforePass(VkCommandBuffer cmd,const VkRenderPassBeginInfo* begin) {
+  XessCaptureScope ownership;
   std::lock_guard<std::mutex> lock(captureMutex);
   if (!captureImage || !activeFrame || capturedThisFrame) return;
   VkImage source{};VkImageLayout layout{};VkRenderPass pass{};VkFramebuffer fb{};
@@ -258,4 +317,10 @@ FfxApiResource HudCaptureResource() {
   if (!captureImage || !capturedAvailable) return r;
   r.resource=(void*)captureImage;r.description=captureDescription;r.state=FFX_API_RESOURCE_STATE_COMPUTE_READ;return r;
 }
+uint64_t HudCaptureFrameIndex(){std::lock_guard<std::mutex> guard(captureMutex);return capturedAvailable?activeFrame:0;}
+bool HudCaptureFramebufferIsSwapchain(VkFramebuffer fb){
+ std::lock_guard<std::mutex> guard(metadataMutex);auto found=framebuffers.find(fb);if(found==framebuffers.end())return false;
+ for(auto v:found->second.views){auto vi=views.find(v);if(vi!=views.end()){if(swapchainImages.count(vi->second.image))return true;for(const auto& old:retiredCaptures)if(old.second.sources.count(vi->second.image))return true;}}return false;
+}
+void HudCaptureExecuted(VkCommandBuffer primary,uint32_t count,const VkCommandBuffer* children){std::lock_guard<std::mutex> guard(captureMutex);for(uint32_t i=0;i<count;++i)if(captureCommands.count(children[i])){captureCommands.insert(primary);break;}}
 }

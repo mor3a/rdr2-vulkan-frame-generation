@@ -1,6 +1,6 @@
 param(
-  [string]$ZigPath=(Join-Path $PSScriptRoot '..\..\work\toolchain\ziglang\zig.exe'),
-  [string]$DependencyRoot=(Join-Path $PSScriptRoot '..\..\work'),
+  [string]$ZigPath=(Join-Path $PSScriptRoot '.deps\toolchain\zig.exe'),
+  [string]$DependencyRoot=(Join-Path $PSScriptRoot '.deps'),
   [switch]$RunChecks
 )
 $ErrorActionPreference='Stop'
@@ -8,7 +8,8 @@ if(!(Test-Path -LiteralPath $ZigPath)){throw 'Zig 0.16.0 not found. Pass -ZigPat
 $deps=@(
   @{Name='Detours';Url='https://github.com/microsoft/Detours.git';Commit='1dbd4ea281d73d478aa8d09a8b83fbd265f715f7'},
   @{Name='Vulkan-Headers';Url='https://github.com/KhronosGroup/Vulkan-Headers.git';Commit='c46850864f4661461b0f6cb9922c058ffea4915e'},
-  @{Name='Streamline-2.12';Url='https://github.com/NVIDIA-RTX/Streamline.git';Commit='e8aaa6eaac968711fb62473d4ae8256dde20919b'}
+  @{Name='Streamline-2.14.1';Url='https://github.com/NVIDIA-RTX/Streamline.git';Commit='2122257e0fce486f91b385aa63b9a09b0a34b363'}
+
 )
 New-Item -ItemType Directory -Force $DependencyRoot | Out-Null
 foreach($dep in $deps){
@@ -22,23 +23,36 @@ foreach($dep in $deps){
   $head=(& git -C $depPath rev-parse HEAD).Trim()
   if($head -ne $dep.Commit){throw "Dependency revision differs; existing checkout preserved: $depPath"}
 }
-$buildRoot=Join-Path $DependencyRoot 'rdr2-fg-public-0.30-build'
+$buildRoot=Join-Path $DependencyRoot 'rdr2-fg-0.82-build'
 New-Item -ItemType Directory -Force $buildRoot | Out-Null
 $flags=@('c++','-std=c++17','-O2',"-ffile-prefix-map=$PSScriptRoot=.","-ffile-prefix-map=$DependencyRoot=dependencies",'-fms-extensions','-Wno-macro-redefined','-Wno-nullability-completeness',
   '-DVK_NO_PROTOTYPES','-DWIN32_LEAN_AND_MEAN','-DNOMINMAX','-DDETOURS_X64',
   "-I$(Join-Path $DependencyRoot 'Vulkan-Headers/include')",
-  "-I$(Join-Path $DependencyRoot 'Streamline-2.12/include')",
+  "-I$(Join-Path $DependencyRoot 'Streamline-2.14.1/include')",
   "-I$(Join-Path $DependencyRoot 'Detours/src')","-I$(Join-Path $PSScriptRoot 'src')")
 $flags+=@("-I$(Join-Path $PSScriptRoot 'vendor/imgui')","-I$(Join-Path $PSScriptRoot 'vendor')")
-$src=@('dllmain.cpp','log.cpp','config.cpp','vkhooks.cpp','slboot.cpp','inputs.cpp','ngx_capture.cpp','ngx_capture.S','ampere_boot.cpp','rdr_camera.cpp','menu.cpp','fsr_native.cpp','hud_capture.cpp','hud_mask.cpp','performance_probe.cpp') | ForEach-Object {Join-Path $PSScriptRoot "src/$_"}
+# These regression cases are constexpr/static_assert checks. Compile them on
+# every build without executing a test binary or launching the game.
+& $ZigPath @flags '-c' (Join-Path $PSScriptRoot 'tests/frame_history.cpp') '-o' (Join-Path $buildRoot 'frame_history.obj') *> (Join-Path $buildRoot 'frame-history-check.log')
+if($LASTEXITCODE -ne 0){Get-Content -LiteralPath (Join-Path $buildRoot 'frame-history-check.log') -Tail 25;throw 'Frame history regression checks failed.'}
+& $ZigPath @flags '-c' (Join-Path $PSScriptRoot 'tests/xess_queues.cpp') '-o' (Join-Path $buildRoot 'xess_queues.obj') *> (Join-Path $buildRoot 'xess-queues-check.log')
+if($LASTEXITCODE -ne 0){Get-Content -LiteralPath (Join-Path $buildRoot 'xess-queues-check.log') -Tail 25;throw 'XeSS queue regression checks failed.'}
+& $ZigPath @flags '-c' (Join-Path $PSScriptRoot 'tests/gpu_guard.cpp') '-o' (Join-Path $buildRoot 'gpu_guard.obj') *> (Join-Path $buildRoot 'gpu-guard-check.log')
+if($LASTEXITCODE -ne 0){Get-Content -LiteralPath (Join-Path $buildRoot 'gpu-guard-check.log') -Tail 20;throw 'GPU vendor guard regression checks failed.'}
+& $ZigPath @flags '-c' (Join-Path $PSScriptRoot 'tests/bridge_recreation.cpp') '-o' (Join-Path $buildRoot 'bridge_recreation.obj') *> (Join-Path $buildRoot 'bridge-recreation-check.log')
+if($LASTEXITCODE -ne 0){Get-Content -LiteralPath (Join-Path $buildRoot 'bridge-recreation-check.log') -Tail 25;throw 'Bridge format/lifecycle checks failed.'}
+$src=@('dllmain.cpp','log.cpp','config.cpp','vkhooks.cpp','slboot.cpp','inputs.cpp','render_reprojection.cpp','input_capture.cpp','ngx_capture.cpp','ngx_capture.S','ampere_boot.cpp','turing_unlock.cpp','gpu_guard.cpp','rdr_camera.cpp','menu.cpp','hud_capture.cpp','native_hud.cpp','hud_mask.cpp','performance_probe.cpp','fg_preset.cpp') | ForEach-Object {Join-Path $PSScriptRoot "src/$_"}
+& $ZigPath @flags '-c' (Join-Path $PSScriptRoot 'tests/bridge_results.cpp') '-o' (Join-Path $buildRoot 'bridge_results.obj') *> (Join-Path $buildRoot 'bridge-results-check.log')
+if($LASTEXITCODE -ne 0){Get-Content -LiteralPath (Join-Path $buildRoot 'bridge-results-check.log') -Tail 20;throw 'SL warning/error classification regression failed.'}
 $src+=@('imgui.cpp','imgui_draw.cpp','imgui_tables.cpp','imgui_widgets.cpp','imgui_impl_win32.cpp','imgui_impl_dx11.cpp') | ForEach-Object {Join-Path $PSScriptRoot "vendor/imgui/$_"}
 $src=$src | Where-Object {$_ -notlike '*imgui_impl_dx11.cpp'}
 $src+=@(Join-Path $PSScriptRoot 'src/menu_vulkan.cpp'),(Join-Path $PSScriptRoot 'vendor/imgui/imgui_impl_vulkan.cpp')
 $detours=@('detours.cpp','disasm.cpp','modules.cpp','image.cpp','creatwth.cpp') | ForEach-Object {Join-Path $DependencyRoot "Detours/src/$_"}
 $binary=Join-Path $buildRoot 'RDR2VulkanFG.asi'
 $log=Join-Path $buildRoot 'build.log'
-$src+=@(Join-Path $PSScriptRoot 'src/update_check.cpp')
-$buildArgs=$flags+@('-shared')+$src+$detours+@((Join-Path $PSScriptRoot 'vendor/d3dcompiler.lib'),'-o',$binary,'-luser32','-ladvapi32','-ld3d11','-ldxgi','-lgdi32','-ldwmapi','-lcomctl32','-limm32','-lwinhttp','-lshell32','-lole32','-lversion','-Wl,--dynamicbase','-Wl,--nxcompat')
+$src+=@(Join-Path $PSScriptRoot 'src/update_check.cpp'),(Join-Path $PSScriptRoot 'vendor/xemfg-reference/host_unlock.cpp')
+$src+=@('xess_bridge_device','dlssg_bridge_runtime','xess_bridge_runtime','xess_output_pacing','xess_bridge_plan','xess_bridge_snapshot','xess_bridge_handoff','xess_provider','camera_frame','experiment_metrics','core_diagnostics') | ForEach-Object {Join-Path $PSScriptRoot "src/$_.cpp"}
+$buildArgs=$flags+@('-shared')+$src+$detours+@((Join-Path $PSScriptRoot 'vendor/d3dcompiler.lib'),'-o',$binary,'-lbcrypt','-luser32','-ladvapi32','-ld3d11','-ld3d12','-ldxgi','-lgdi32','-ldwmapi','-lcomctl32','-limm32','-lwinhttp','-lshell32','-lole32','-lversion','-Wl,--dynamicbase','-Wl,--nxcompat')
 & $ZigPath @buildArgs *> $log
 if($LASTEXITCODE -ne 0){Get-Content -LiteralPath $log -Tail 30;throw 'ASI build failed.'}
 $diagnosticBinary=Join-Path $buildRoot 'RDR2VulkanFGDiagnostics.dll'
@@ -49,11 +63,12 @@ Copy-Item -LiteralPath $diagnosticBinary -Destination (Join-Path $PSScriptRoot '
 New-Item -ItemType Directory -Path (Join-Path $buildRoot 'RDR2VulkanFG') -Force | Out-Null
 Copy-Item -LiteralPath $diagnosticBinary -Destination (Join-Path $buildRoot 'RDR2VulkanFG/RDR2VulkanFGDiagnostics.dll') -Force
 if($RunChecks){
-  foreach($test in @('contracts','capture_abi','fps_meter','swapchain_lock','menu_startup','diagnostics','present_compat','present_route','latency_imports','vulkan_owner')){
+  foreach($test in @('frame_association','runtime_errors','menu_preview','camera_reprojection','xess_history','fsr_color_space','fg_state','message_input','contracts','capture_abi','fps_meter','update_manifest','swapchain_lock','menu_startup','diagnostics','present_compat','present_route','latency_imports','vulkan_owner')){
     $exe=Join-Path $buildRoot "$test.exe"
     $argsTest=$flags+@(Join-Path $PSScriptRoot "tests/$test.cpp")
     if($test -eq 'capture_abi'){$argsTest+=@(Join-Path $PSScriptRoot 'src/ngx_capture.S')}
     if($test -eq 'diagnostics'){$argsTest+=@(Join-Path $PSScriptRoot 'src/log.cpp'),'-lversion'}
+    if($test -eq 'message_input'){$argsTest+=@('-lbcrypt','-luser32')}
     $argsTest+=@('-o',$exe)
     & $ZigPath @argsTest *> (Join-Path $buildRoot "$test-build.log")
     if($LASTEXITCODE -ne 0){throw "Check build failed: $test"}
@@ -70,7 +85,7 @@ if($RunChecks){
   if(!$fixtureProcess.WaitForExit(10000)){Stop-Process -Id $fixtureProcess.Id;throw 'Fatal fixture exceeded its timeout.'}
   $fixtureLog=Join-Path $fatalRoot 'RDR2VulkanFG.log'
   $record=''
-  for($attempt=0;$attempt -lt 30;$attempt++){
+  for($attempt=0;$attempt -lt 100;$attempt++){
     $record=Get-Content -LiteralPath $fixtureLog -Raw
     if($record -match 'process exit code=0xc06d007f'){break}
     Start-Sleep -Milliseconds 100
@@ -81,14 +96,13 @@ if($RunChecks){
   Write-Host 'Unhandled delay-load crash: missing DLL/export, external stacks and actual process exit captured in one log: PASS'
   $fixtureProcess=Start-Process -FilePath $fatalExe -ArgumentList '--fastfail' -WindowStyle Hidden -PassThru
   if(!$fixtureProcess.WaitForExit(10000)){Stop-Process -Id $fixtureProcess.Id;throw 'Fail-fast fixture exceeded its timeout.'}
-  for($attempt=0;$attempt -lt 30;$attempt++){$record=Get-Content -LiteralPath $fixtureLog -Raw;if($record -match 'process exit code=0xc0000409'){break};Start-Sleep -Milliseconds 100}
+  for($attempt=0;$attempt -lt 100;$attempt++){$record=Get-Content -LiteralPath $fixtureLog -Raw;if($record -match 'process exit code=0xc0000409'){break};Start-Sleep -Milliseconds 100}
   if($record -notmatch 'DEBUG EXCEPTION code=0xc0000409' -or $record -notmatch 'subcode=7' -or $record -notmatch 'threads dumped' -or $record -notmatch 'process exit code=0xc0000409'){throw 'Actual fail-fast context was not captured.'}
   Write-Host 'Actual __fastfail(7): final fault context, thread stacks and 0xC0000409 exit captured externally: PASS'
 }
 Copy-Item -LiteralPath $binary -Destination (Join-Path $PSScriptRoot 'RDR2VulkanFG.asi') -Force
-$cameraBinary=Join-Path $PSScriptRoot 'RDR2VulkanFGCamera.asi'
-& $ZigPath c++ -O2 -shared -DWIN32_LEAN_AND_MEAN (Join-Path $PSScriptRoot 'src/camera_entry.cpp') -o $cameraBinary '-Wl,--dynamicbase' '-Wl,--nxcompat' *> (Join-Path $buildRoot 'camera-build.log')
-if($LASTEXITCODE -ne 0){throw 'Camera helper build failed.'}
+# Sampled camera registration is owned by the main ASI in 0.80.
+# Do not build or ship a second camera ASI.
 Get-FileHash -LiteralPath $binary -Algorithm SHA256 | Select-Object Hash,Path
 Write-Host 'Build complete. Compilation does not replace runtime validation.'
 

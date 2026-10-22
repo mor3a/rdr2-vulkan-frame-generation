@@ -3,6 +3,7 @@ namespace fgvk {
 struct MenuStartup {
   bool ready=false;
   void Reset(){ready=false;}
-  void Presented(bool evaluated,bool success){if(evaluated && success)ready=true;}
+  // UI does not depend on DLSS, camera registration or provider readiness.
+  void Presented(bool /*evaluated*/,bool success){if(success)ready=true;}
 };
 }

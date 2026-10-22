@@ -1,0 +1,9 @@
+EXPORTS
+  MfgUnlockCoreLoaded @1
+  MfgUnlockPresetSnapshot @2
+  MfgUnlockSampleFrameTelemetry @3
+  MfgUnlockWaitStartup @4
+  MfgUnlockSetPreset @5
+
+  MfgUnlockSetIntervalLogging @6
+  MfgUnlockReadIntervals @7

@@ -4,13 +4,17 @@
 #include <cstring>
 #include "log.h"
 #include "ampere_boot.h"
+#include "turing_unlock.h"
+#include "core_diagnostics.h"
+#include "config.h"
+#include "runtime_errors.h"
 
 namespace fgvk {
 namespace {
 SRWLOCK g_lock = SRWLOCK_INIT;
 wchar_t g_gpuName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE]{};
 GpuFamily g_family = GpuFamily::Unknown;
-enum class Unlock { NotAttempted, Loaded, TuringLoaded, Failed, TuringFailed, Native, Unsupported, UnsupportedDevice };
+enum class Unlock { NotAttempted, Loaded, TuringLoaded, AdaLoaded, Failed, TuringFailed, AdaFailedNative, Native, Unsupported, UnsupportedDevice };
 Unlock g_unlock = Unlock::NotAttempted;
 
 GpuFamily Classify(const wchar_t* name) {
@@ -79,17 +83,18 @@ GpuFgSupport GPUFrameGenerationSupport() {
   }
 }
 bool ExperimentalTuringEnabled() {
-  wchar_t path[MAX_PATH]{}; IniPath(path,MAX_PATH);
-  return path[0] && GetPrivateProfileIntW(L"fgvk",L"EnableExperimentalRTX20",0,path)!=0;
+  return Cfg().experimentalRTX20;
 }
 const char* GPUUnlockStatus() {
   AcquireSRWLockShared(&g_lock); Unlock state=g_unlock; ReleaseSRWLockShared(&g_lock);
   switch (state) {
     case Unlock::Loaded: return "RTX 30 unlock loaded";
-    case Unlock::TuringLoaded: return "experimental RTX 20 unlock loaded (untested on RTX 20 hardware)";
+    case Unlock::TuringLoaded: return "RTX 20 unlock 0.4.0 loaded; D3D12 bridge; provider validation pending";
+    case Unlock::AdaLoaded: return "RTX 40 MFG core loaded; multiplier capacity is provider-reported";
     case Unlock::Failed: return "RTX 30 unlock failed";
     case Unlock::TuringFailed: return "experimental RTX 20 unlock failed";
-    case Unlock::Native: return "native driver support; unlock not needed";
+    case Unlock::AdaFailedNative: return "RTX 40 MFG core unavailable; native frame generation fallback";
+    case Unlock::Native: return "RTX 50 native frame/multi-frame generation; provider-reported capacity";
     case Unlock::Unsupported: return "RTX 20 native DLSS-G unsupported";
     case Unlock::UnsupportedDevice: return "GPU family not recognized; unlock disabled for safety";
     default: return GPUFamily()==GpuFamily::RTX20 && !ExperimentalTuringEnabled()
@@ -100,28 +105,47 @@ const char* GPUUnlockStatus() {
 
 bool LoadAmpereUnlock(){
   static bool attempted=false,ready=false;
-  if(attempted)return ready;attempted=true;
+  if(attempted)return ready || GPUFamily()==GpuFamily::RTX40;attempted=true;
   const GpuFamily family=GPUFamily();
   const bool turing=family==GpuFamily::RTX20;
+  const bool ada=family==GpuFamily::RTX40;
   if(turing && !ExperimentalTuringEnabled()){
     AcquireSRWLockExclusive(&g_lock);g_unlock=Unlock::Unsupported;ReleaseSRWLockExclusive(&g_lock);
-    Log("RTX 20/Turing detected; experimental v1.2.2 Turing route disabled (set EnableExperimentalRTX20=1 to opt in)");return false;
+    Log("RTX 20/Turing detected; RTX 20 D3D12 unlock route disabled (set EnableExperimentalRTX20=1 to opt in)");return false;
   }
-  if(family==GpuFamily::RTX40 || family==GpuFamily::RTX50){AcquireSRWLockExclusive(&g_lock);g_unlock=Unlock::Native;ReleaseSRWLockExclusive(&g_lock);Log("RTX 40/50 detected; native DLSS-G path, private Ampere unlock skipped");return true;}
-  if(family!=GpuFamily::RTX30 && !turing){AcquireSRWLockExclusive(&g_lock);g_unlock=Unlock::UnsupportedDevice;ReleaseSRWLockExclusive(&g_lock);Log("GPU family not recognized as RTX 30/40/50 or opted-in RTX 20; refusing private unlock");return false;}
+  if(family==GpuFamily::RTX50){ready=true;AcquireSRWLockExclusive(&g_lock);g_unlock=Unlock::Native;ReleaseSRWLockExclusive(&g_lock);Log("RTX 50 detected; native DLSS-G/MFG path; multiplier capacity will be queried from the provider");return true;}
+  if(family!=GpuFamily::RTX30 && !turing && !ada){AcquireSRWLockExclusive(&g_lock);g_unlock=Unlock::UnsupportedDevice;ReleaseSRWLockExclusive(&g_lock);Log("GPU family not recognized as RTX 30/40/50 or opted-in RTX 20; refusing private unlock");return false;}
+  if(ada)Log("RTX 40 detected; loading bundled Ada-capable MFG core before Streamline init (native FG alone is limited to 2x)");
+  const auto failedState=ada?Unlock::AdaFailedNative:turing?Unlock::TuringFailed:Unlock::Failed;
   if(GetModuleHandleW(L"RTX40MFGCore.dll")){
-    Log("An Ampere core is already loaded; refusing two unlock stacks");AcquireSRWLockExclusive(&g_lock);g_unlock=turing?Unlock::TuringFailed:Unlock::Failed;ReleaseSRWLockExclusive(&g_lock);return false;
+    RuntimeErrors::ReportError(RuntimeErrors::Code::UnlockInit,"An MFG core was already loaded; refusing conflicting unlock stacks");Log("An MFG core is already loaded; refusing two unlock stacks");AcquireSRWLockExclusive(&g_lock);g_unlock=failedState;ReleaseSRWLockExclusive(&g_lock);return ada;
   }
   HMODULE self{};GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     reinterpret_cast<LPCWSTR>(&LoadAmpereUnlock),&self);
   wchar_t path[MAX_PATH]{};GetModuleFileNameW(self,path,MAX_PATH);
-  wchar_t* slash=wcsrchr(path,L'\\');if(!slash)return false;*(slash+1)=0;
-  wchar_t full[MAX_PATH]{};swprintf(full,MAX_PATH,L"%sRDR2VulkanFG\\Ampere\\RTX40MFGCore.dll",path);
+  wchar_t* slash=wcsrchr(path,L'\\');if(!slash){AcquireSRWLockExclusive(&g_lock);g_unlock=failedState;ReleaseSRWLockExclusive(&g_lock);return ada;}*(slash+1)=0;
+  wchar_t full[MAX_PATH]{};swprintf(full,MAX_PATH,L"%sRDR2VulkanFG\\Core\\RTX40MFGCore.dll",path);
+  if(turing){
+    wchar_t directory[MAX_PATH]{};swprintf(directory,MAX_PATH,L"%sRDR2VulkanFG\\Core\\RTX20",path);
+    char error[320]{};
+    ready=LoadTuringUnlock040(directory,error,sizeof(error),unsigned(ReadDLSSGPreset()));
+    if(!ready){RuntimeErrors::ReportError(RuntimeErrors::Code::UnlockInit,error,(int)GetLastError());Log("%s",error);}
+    else{RuntimeErrors::ClearError(RuntimeErrors::Code::UnlockInit);Log("RTX 20 unlock prepared: dlssg_for_sm86 0.4.0 (6f047bd), exact kernels, SR untouched; D3D12 bridge; provider creation remains separate");}
+    AcquireSRWLockExclusive(&g_lock);g_unlock=ready?Unlock::TuringLoaded:Unlock::TuringFailed;ReleaseSRWLockExclusive(&g_lock);
+    return ready;
+  }
   HMODULE core=LoadLibraryExW(full,nullptr,LOAD_WITH_ALTERED_SEARCH_PATH);
-  if(!core){Log("Private Ampere core could not load, Win32=%lu",GetLastError());AcquireSRWLockExclusive(&g_lock);g_unlock=turing?Unlock::TuringFailed:Unlock::Failed;ReleaseSRWLockExclusive(&g_lock);return false;}
+  if(!core){RuntimeErrors::ReportError(RuntimeErrors::Code::UnlockInit,"Bundled RTX40MFGCore.dll could not be loaded",(int)GetLastError());Log("Bundled MFG core could not load, Win32=%lu; RTX40 native fallback=%d",GetLastError(),(int)ada);AcquireSRWLockExclusive(&g_lock);g_unlock=failedState;ReleaseSRWLockExclusive(&g_lock);return ada;}
   using Loaded=BOOL(WINAPI*)();auto loaded=reinterpret_cast<Loaded>(GetProcAddress(core,"MfgUnlockCoreLoaded"));
-  ready=loaded && loaded();AcquireSRWLockExclusive(&g_lock);g_unlock=ready?(turing?Unlock::TuringLoaded:Unlock::Loaded):(turing?Unlock::TuringFailed:Unlock::Failed);ReleaseSRWLockExclusive(&g_lock);
-  Log("Private RTX 30/20 unlock core attached=%d; provider readiness not established; turing=%d",(int)ready,(int)turing);
-  return ready;
+  using WaitStartup=BOOL(WINAPI*)(DWORD);
+  auto waitStartup=reinterpret_cast<WaitStartup>(GetProcAddress(core,"MfgUnlockWaitStartup"));
+  const ULONGLONG started=GetTickCount64();
+  ready=loaded && loaded() && waitStartup && waitStartup(15000);
+  if(!ready)RuntimeErrors::ReportError(RuntimeErrors::Code::UnlockInit,"Bundled MFG startup exports were missing or preparation did not complete");
+  else {RuntimeErrors::ClearError(RuntimeErrors::Code::UnlockInit);SetCoreIntervalTracing(Cfg().intervalLogging);}
+  Log("Private unlock startup prepared=%d waitMs=%llu; provider validation remains separate",(int)ready,(unsigned long long)(GetTickCount64()-started));
+  AcquireSRWLockExclusive(&g_lock);g_unlock=ready?(ada?Unlock::AdaLoaded:turing?Unlock::TuringLoaded:Unlock::Loaded):failedState;ReleaseSRWLockExclusive(&g_lock);
+  Log("Bundled MFG core attached=%d; provider readiness not established; turing=%d ada=%d nativeFallback=%d",(int)ready,(int)turing,(int)ada,(int)(ada&&!ready));
+  return ready || ada;
 }
 }

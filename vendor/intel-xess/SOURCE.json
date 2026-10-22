@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/intel/xess",
+  "commit": "de0fb9c1c510661c571164e1418ceca8101dab69",
+  "files": [
+    "LICENSE.txt",
+    "inc/xell/xell.h",
+    "inc/xell/xell_d3d12.h",
+    "inc/xess_fg/xefg_swapchain.h",
+    "inc/xess_fg/xefg_swapchain_d3d12.h",
+    "inc/xess_fg/xefg_swapchain_debug.h"
+  ]
+}
